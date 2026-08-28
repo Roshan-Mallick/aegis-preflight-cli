@@ -1,0 +1,78 @@
+{
+  "compliant": [
+    {
+      "Name": "aegis-agent-abcd1234",
+      "Mounts": [
+        {
+          "Source": "/home/user/.local/state/aegis/sessions/x/workspace",
+          "Destination": "/workspace",
+          "Mode": "",
+          "RW": true,
+          "Type": "bind"
+        }
+      ],
+      "Config": {
+        "Privileged": false,
+        "CapDrop": ["ALL"],
+        "User": "1000:1000"
+      },
+      "HostConfig": {
+        "NetworkMode": "none",
+        "Privileged": false,
+        "CapDrop": ["ALL"],
+        "Resources": { "Memory": 2147483648, "PidsLimit": 512 }
+      },
+      "State": { "Running": true }
+    }
+  ],
+  "docker_socket_mounted": [
+    {
+      "Name": "evil",
+      "Mounts": [
+        { "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": true, "Type": "bind" },
+        { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
+      ],
+      "Config": { "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
+      "HostConfig": { "NetworkMode": "none", "Resources": { "PidsLimit": 512 } }
+    }
+  ],
+  "bridge_network_root": [
+    {
+      "Name": "loose",
+      "Mounts": [
+        { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
+      ],
+      "Config": { "User": "", "CapDrop": [], "Privileged": false },
+      "HostConfig": { "NetworkMode": "bridge", "Resources": {} }
+    }
+  ],
+  "extra_host_mount": [
+    {
+      "Name": "sneaky",
+      "Mounts": [
+        { "Source": "/home/user/.ssh", "Destination": "/hostssh", "RW": false, "Type": "bind" },
+        { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
+      ],
+      "Config": { "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
+      "HostConfig": { "NetworkMode": "none", "Resources": { "PidsLimit": 512 } }
+    }
+  ],
+  "missing_workspace": [
+    {
+      "Name": "empty",
+      "Mounts": [],
+      "Config": { "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
+      "HostConfig": { "NetworkMode": "none", "Resources": { "PidsLimit": 512 } }
+    }
+  ],
+  "docker29_flat": [
+    {
+      "Name": "flat29",
+      "Mounts": [
+        { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
+      ],
+      "Config": { "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
+      "HostConfig": { "NetworkMode": "none", "Privileged": false, "CapDrop": ["ALL"], "PidsLimit": 512, "Memory": 2147483648 }
+    }
+  ]
+}

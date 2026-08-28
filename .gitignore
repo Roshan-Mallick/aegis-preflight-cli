@@ -1,0 +1,60 @@
+# AEGIS .gitignore
+
+# --- Internal dev / build logs (not part of the product) ---
+build.md
+
+# --- Stale top-level assets (embedded copies live under internal/) ---
+/assets/
+
+# --- Build outputs / binaries ---
+/aegis
+/bin/
+*.exe
+*.out
+*.test
+
+# --- Go build / coverage ---
+/coverage.out
+*.cover
+*.prof
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Temporary files ---
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.iml
+
+# --- AEGIS runtime state (never commit) ---
+# Session data, event stores, evidence bundles, model inference artifacts.
+/.local/
+state/
+sessions/
+*.jsonl
+finder-*.json
+
+# --- AEGIS PreFlight artifacts (generated per session) ---
+FIX_REQUEST*.md
+SECURITY_ISSUES*.md
+verified-diff.*
+model-analysis.md
+
+# --- Secrets / environment ---
+.env
+.env.*
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+
+# --- Test runtime artifacts (generated, not in-tree fixtures) ---
+/tmp/
+coverage/
