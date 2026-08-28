@@ -2,6 +2,8 @@
 
 **Repository:** `aegis-preflight-cli`
 
+**Original Author & Owner:** [Roshan Mallick](https://github.com/Roshan-Mallick) · Copyright (c) 2026 Roshan Mallick
+
 AEGIS is a security runtime and control plane for AI coding agents. It treats the agent as **untrusted by design**: the agent can only write to an isolated copy of the project, its network egress is controlled, all of its observations are recorded, and changes reach the trusted codebase only after PreFlight security validation passes.
 
 ## What problem it solves
@@ -205,6 +207,7 @@ docs/                   Threat model and event-schema documentation
 
 - [Event Schema](docs/EVENT-SCHEMA.md) — the canonical event format shared by all components.
 - [Threat Model](docs/THREAT-MODEL.md) — detailed security boundaries and STRIDE/PASTA analysis.
+- [Authors](AUTHORS.md) — original author and maintainer information.
 
 ## Current project status
 
@@ -221,4 +224,4 @@ Early-stage but functional (`v0.1.0`). The core end-to-end pipeline works: sandb
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
-Copyright (c) 2026 [Roshan Mallick](https://github.com/Roshan-Mallick)
+Copyright (c) 2026 [Roshan Mallick](https://github.com/Roshan-Mallick) — see [AUTHORS.md](AUTHORS.md).
