@@ -98,7 +98,7 @@ ENTRY → SNAPSHOT → SANDBOX → AGENT (ACTIVE) → AGENT_FINISHED → SECURIT
 ### From source
 
 ```bash
-git clone <your-aegis-preflight-cli-url>
+git clone https://github.com/Roshan-Mallick/aegis-preflight-cli
 cd aegis-preflight-cli
 go build -o aegis ./cmd/aegis
 ```
@@ -106,7 +106,7 @@ go build -o aegis ./cmd/aegis
 ### One-line installer
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/<owner>/aegis-preflight-cli/main/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/Roshan-Mallick/aegis-preflight-cli/main/scripts/install.sh | bash
 ```
 
 The installer downloads a release binary (falls back to a source build), installs it into `~/bin`, and optionally builds the sandbox Docker images. Adjust `REPO` and the download URL in `scripts/install.sh` to match your fork before publishing a release.
@@ -219,4 +219,6 @@ Early-stage but functional (`v0.1.0`). The core end-to-end pipeline works: sandb
 
 ## License
 
-MIT
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright (c) 2026 [Roshan Mallick](https://github.com/Roshan-Mallick)
