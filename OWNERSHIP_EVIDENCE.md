@@ -51,9 +51,16 @@ The release tag and all releases were created with a GPG signature:
 | Field | Value |
 |-------|-------|
 | **OTS proof file** | `AEGIS-Preflight-v1.0.0.tar.gz.ots` |
-| **Status** | See Phase 5 notes below. |
+| **Proof file size** | 665 bytes |
+| **Client** | `opentimestamps-client` v0.7.2 (installed in a local venv: `python3 -m venv .ots-venv && .ots-venv/bin/pip install opentimestamps-client`) |
+| **Proof content hash** | `3b15f9c1dff919a3f6ce26eee78d7d785903cb9e308cf51da0d581ab294f7e08` (matches the archive SHA-256) |
+| **Calendars used** | a.pool.opentimestamps.org, b.pool.opentimestamps.org, a.pool.eternitywall.com, ots.btc.catallaxy.com |
+| **Timestamp status** | Registered and submitted to calendars. Verification currently shows **pending confirmation in the Bitcoin blockchain** (pending the next Bitcoin block). Once confirmed, `ots verify` will report the proof as verified with the anchoring block. |
+| **Verification command** | `ots verify AEGIS-Preflight-v1.0.0.tar.gz.ots` |
 
-The archive hash `/ SHA-256` above is the value that is (or should be) anchored by the OpenTimestamps proof file. A timestamp anchors the existence of the exact archive content at a point in time; it does not by itself establish authorship.
+The archive hash `/ SHA-256` above is the value anchored by this OpenTimestamps proof. A timestamp anchors the existence of the exact archive content at a point in time; it does not by itself establish authorship.
+
+> **PENDING / REQUIRES MANUAL ACTION:** To complete verification, run `ots verify AEGIS-Preflight-v1.0.0.tar.gz.ots` again after the next Bitcoin block confirms (typically confirmable within minutes to a day). Do not claim the timestamp is fully verified until it reports success.
 
 ## 6. Timeline Summary
 
