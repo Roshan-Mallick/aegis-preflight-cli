@@ -12,6 +12,7 @@
         }
       ],
       "Config": {
+        "Image": "aegis-runtime:v1",
         "Privileged": false,
         "CapDrop": ["ALL"],
         "User": "1000:1000"
@@ -72,6 +73,16 @@
         { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
       ],
       "Config": { "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
+      "HostConfig": { "NetworkMode": "none", "Privileged": false, "CapDrop": ["ALL"], "PidsLimit": 512, "Memory": 2147483648 }
+    }
+  ],
+  "fat_image": [
+    {
+      "Name": "unpruned",
+      "Mounts": [
+        { "Source": "/tmp/ws", "Destination": "/workspace", "RW": true, "Type": "bind" }
+      ],
+      "Config": { "Image": "aegis-agent:v1", "User": "1000:1000", "CapDrop": ["ALL"], "Privileged": false },
       "HostConfig": { "NetworkMode": "none", "Privileged": false, "CapDrop": ["ALL"], "PidsLimit": 512, "Memory": 2147483648 }
     }
   ]

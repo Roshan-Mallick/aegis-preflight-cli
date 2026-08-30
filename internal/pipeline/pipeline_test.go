@@ -278,44 +278,43 @@ func TestPreflightPipelineIntegration(t *testing.T) {
 	}
 }
 
+// TestWorkspaceManifestAndDiff pins the direct-mount baseline: the audit
+// manifest is built from the live project root itself (BuildManifest, no
+// copy), the agent edits the project directory in place, and ComputeDiff
+// resolves the session change set against that same live project.
 func TestWorkspaceManifestAndDiff(t *testing.T) {
-	srcDir := t.TempDir()
-	wsDir := t.TempDir()
+	projectRoot := t.TempDir()
 
-	writeFile(t, srcDir, "main.go", "package main\n\nfunc main() {}\n")
-	writeFile(t, srcDir, "README.md", "# Test\n")
+	writeFile(t, projectRoot, "main.go", "package main\n\nfunc main() {}\n")
+	writeFile(t, projectRoot, "README.md", "# Test\n")
 
-	snapResult, err := workspace.Snapshot(srcDir, wsDir)
+	before, err := workspace.BuildManifest(projectRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	stateRoot := t.TempDir()
-	mgr, err := session.Create(stateRoot, srcDir, "opencode", "dev")
+	mgr, err := session.Create(stateRoot, projectRoot, "opencode", "dev")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mgr.Close()
 
-	if err := workspace.SaveManifest(mgr.Dir(), snapResult.Manifest); err != nil {
+	if err := workspace.SaveManifest(mgr.Dir(), before); err != nil {
 		t.Fatal(err)
 	}
 
-	before, err := workspace.LoadManifest(mgr.Dir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The agent edits the live project (via the container's /workspace mount).
+	writeFile(t, projectRoot, "main.go", "package main\n\nfunc main() { println(\"hello\") }\n")
+	writeFile(t, projectRoot, "new.go", "package main\n")
 
-	writeFile(t, wsDir, "main.go", "package main\n\nfunc main() { println(\"hello\") }\n")
-	writeFile(t, wsDir, "new.go", "package main\n")
-
-	changes, _, err := workspace.ComputeDiff(before, wsDir)
+	changes, _, err := workspace.ComputeDiff(before, projectRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if len(changes) == 0 {
-		t.Fatal("expected changes after modifying files")
+		t.Fatal("expected changes after modifying the project in place")
 	}
 
 	foundModify := false

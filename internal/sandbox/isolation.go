@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/eth0x1/aegis/internal/images"
 )
 
 type inspectMount struct {
@@ -16,6 +18,7 @@ type inspectMount struct {
 }
 
 type inspectConfig struct {
+	Image      string   `json:"Image"`
 	Privileged bool     `json:"Privileged"`
 	CapDrop    []string `json:"CapDrop"`
 	User       string   `json:"User"`
@@ -86,6 +89,36 @@ func ParseInspect(raw []byte) ([]inspectItem, error) {
 	return items, nil
 }
 
+// allowedToolMount reports whether a bind mount is part of the documented
+// minimal attachment set: the live project (/workspace) plus the controlled
+// agent-tool chain mounted read-only under /usr/local/bin (agent binaries)
+// and /agent (the single controlled agent, its config/data, and executable
+// scratch space). Host system-library files pulled in by ldd for those
+// binaries land on standard library paths and are regular (non-host-data)
+// files, so they are accepted too. Anything else — a host directory, a
+// credentials dir, a socket — is an unexpected host path and is flagged.
+func allowedToolMount(dest, src string) bool {
+	acceptedPrefixes := []string{
+		"/workspace",
+		"/usr/local/bin/",
+		"/agent/",
+		"/lib/",
+		"/lib64/",
+		"/usr/lib/",
+		"/usr/lib64/",
+		"/usr/bin/",
+	}
+	if dest == "/workspace" || dest == "/usr/local/bin" || dest == "/agent" {
+		return true
+	}
+	for _, p := range acceptedPrefixes {
+		if strings.HasPrefix(dest, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func VerifyIsolation(raw []byte, workspaceHostPath string) []string {
 	items, err := ParseInspect(raw)
 	if err != nil {
@@ -93,6 +126,17 @@ func VerifyIsolation(raw []byte, workspaceHostPath string) []string {
 	}
 	c := items[0]
 	var v []string
+
+	// The container must run from the minimal runtime image — not the fat
+	// tool image. This is the core filesystem-boundary assertion: the
+	// runtime image is the pruned filesystem with no /home, /var, /root,
+	// /srv, /opt and with an unreadable /etc/passwd, so the agent cannot
+	// reach any of those paths by any means. (Config.Image is empty in
+	// some minimal inspect fixtures, in which case the other checks still
+	// apply.)
+	if img := c.Config.Image; img != "" && !strings.HasPrefix(img, runtimeImagePrefix) {
+		v = append(v, "sandbox image is not the minimal runtime (want "+images.RuntimeImage+"): "+img)
+	}
 
 	wsAbs, _ := filepath.Abs(workspaceHostPath)
 	mounts := c.Mounts
@@ -113,7 +157,7 @@ func VerifyIsolation(raw []byte, workspaceHostPath string) []string {
 			if !m.RW {
 				v = append(v, "/workspace is not read-write")
 			}
-		} else if m.Type == "bind" && !strings.HasPrefix(m.Destination, "/workspace") {
+		} else if m.Type == "bind" && !allowedToolMount(m.Destination, m.Source) {
 			v = append(v, "unexpected bind mount into sandbox: "+m.Destination+" <- "+m.Source)
 		}
 	}

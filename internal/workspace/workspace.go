@@ -13,11 +13,6 @@ import (
 	"strings"
 )
 
-var projectMarkers = []string{
-	".git", "go.mod", "package.json", "pyproject.toml", "setup.py",
-	"Cargo.toml", "composer.json", "pom.xml", "build.gradle", "requirements.txt",
-}
-
 var excludedDirs = map[string]bool{
 	".git": true, "node_modules": true, "__pycache__": true,
 	".venv": true, "venv": true, ".tox": true, ".mypy_cache": true,
@@ -31,6 +26,15 @@ var (
 	SnapshotMaxFiles       = 200000
 )
 
+// DetectRoot resolves the launch directory itself as the security boundary.
+//
+// PROJECT_ROOT = canonical(realpath(start)): the exact directory the agent is
+// launched from (or given via --project). There is no marker-based walk-up and
+// no snapshot copy — this directory is mounted directly into the sandbox as
+// /workspace and is the only writable, reachable filesystem realm for the
+// agent. The user's home directory and the filesystem root are refused as
+// boundaries: mounting the home directory would expose every sibling project,
+// and mounting "/" would expose the whole host filesystem.
 func DetectRoot(start string) (string, error) {
 	abs, err := filepath.Abs(start)
 	if err != nil {
@@ -39,27 +43,43 @@ func DetectRoot(start string) (string, error) {
 	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
 		return "", fmt.Errorf("not a directory: %s", abs)
 	}
-	home, _ := os.UserHomeDir()
-	cur := abs
-	for {
-		for _, m := range projectMarkers {
-			if _, err := os.Stat(filepath.Join(cur, m)); err == nil {
-				return cur, nil
-			}
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			break
-		}
-		cur = parent
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve real path: %w", err)
 	}
-	if home != "" && abs == home {
+	home, _ := os.UserHomeDir()
+	if home != "" && real == home {
 		return "", fmt.Errorf("refusing to use home directory as project root")
 	}
-	if abs == string(filepath.Separator) {
+	if real == string(filepath.Separator) {
 		return "", fmt.Errorf("refusing to use filesystem root as project root")
 	}
-	return abs, nil
+	return real, nil
+}
+
+// WithinRoot reports whether candidate lives inside — or is exactly — the
+// project boundary root. It compares component-wise (never by naive string
+// prefix) and, when the candidate exists on disk, resolves symlinks first so
+// an escape aimed through a link is never reported as "inside". This mirrors,
+// for host-side paths, the container mount boundary that makes /workspace the
+// only reachable writable realm.
+func WithinRoot(root, candidate string) (bool, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false, err
+	}
+	candAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false, err
+	}
+	if ev, err := filepath.EvalSymlinks(candAbs); err == nil {
+		candAbs = ev
+	}
+	rel, err := filepath.Rel(rootAbs, candAbs)
+	if err != nil {
+		return false, err
+	}
+	return validRel(rel), nil
 }
 
 type Entry struct {
@@ -331,6 +351,13 @@ func buildCurrentManifest(base string) (Manifest, error) {
 	return m, nil
 }
 
+// BuildManifest computes the current manifest of a live directory. In the
+// direct-mount model this is the project root itself: the audit baseline for
+// the session is the project as it exists, and never a copy.
+func BuildManifest(base string) (Manifest, error) {
+	return buildCurrentManifest(base)
+}
+
 func ComputeDiff(before Manifest, workspace string) ([]Change, Manifest, error) {
 	current, err := buildCurrentManifest(workspace)
 	if err != nil {
@@ -508,6 +535,49 @@ func ValidateChanges(trustedRoot string, before Manifest, changes []Change) erro
 	return nil
 }
 
+// ValidatePromotion is the direct-mount equivalent of ValidateChanges. In the
+// in-place sandbox the workspace IS the trusted project: agent edits land
+// directly in the project and that is the contract, so there is no separate
+// baseline conflict to guard against. Security validation still applies in
+// full: every change must be a legal relative path and no symlink target may
+// escape the project when followed from the host side.
+func ValidatePromotion(trustedRoot string, before Manifest, changes []Change) error {
+	trustedAbs, err := filepath.Abs(trustedRoot)
+	if err != nil {
+		return err
+	}
+	var unsafe []string
+	for _, ch := range changes {
+		if !validRel(ch.Path) {
+			unsafe = append(unsafe, ch.Path+": illegal path")
+			continue
+		}
+		switch ch.Kind {
+		case KindAdded, KindModified, KindTypeChange:
+			if ch.New == nil {
+				unsafe = append(unsafe, ch.Path+": missing target entry")
+				continue
+			}
+			if ch.New.Type == "symlink" && symlinkEscapes(trustedAbs, filepath.Join(trustedAbs, ch.Path), ch.New.Target) {
+				unsafe = append(unsafe, ch.Path+": symlink escapes trusted project")
+			}
+		case KindDeleted:
+			// A deletion is symmetric here: the file is (or just was) part
+			// of the project.
+		default:
+			unsafe = append(unsafe, ch.Path+": unknown change kind")
+		}
+	}
+	if len(unsafe) > 0 {
+		return &UnsafeChangeError{Violations: unsafe}
+	}
+	return nil
+}
+
+// Apply promotes verified changes from a separate workspace copy into the
+// trusted root. With the direct-mount model this path is retained only as a
+// bounded utility for explicit copy-based flows (e.g. the e2e harness); the
+// live pipeline no longer produces a workspace copy to promote.
 func Apply(trustedRoot, workspace string, before Manifest, changes []Change) (int, error) {
 	if err := ValidateChanges(trustedRoot, before, changes); err != nil {
 		return 0, err

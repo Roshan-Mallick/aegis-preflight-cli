@@ -45,6 +45,10 @@ func newInitCmd() *cobra.Command {
 					return fmt.Errorf("agent image: %w", err)
 				}
 				fmt.Println("agent image ready:", images.AgentImage)
+				if err := sandbox.EnsureRuntimeImage(ctx); err != nil {
+					return fmt.Errorf("runtime image: %w", err)
+				}
+				fmt.Println("runtime image ready:", images.RuntimeImage)
 				if err := network.EnsureProxyImage(ctx); err != nil {
 					return fmt.Errorf("proxy image: %w", err)
 				}

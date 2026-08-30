@@ -18,10 +18,12 @@ func newRootCmd() *cobra.Command {
 		Use:   "aegis",
 		Short: "AEGIS zero-trust security runtime for AI coding agents",
 		Long: `AEGIS runs AI coding agents inside an isolated sandbox where:
-  - only a session workspace copy is writable,
+  - the launch directory (PROJECT_ROOT) is mounted as /workspace — the only
+    reachable, writable realm; everything outside it is invisible,
   - network egress is allowlisted at the network layer,
   - all agent activity is observed and correlated,
-  - changes reach the trusted project only after PreFlight verification.
+  - every change is baselined and security-validated before the session is
+    released ("aegis apply" validates and records).
 
 The AI agent is never its own security authority.
 
@@ -60,7 +62,7 @@ Getting started:
 		},
 	}
 	root.PersistentFlags().StringVar(&netProfile, "net", "strict", "agent network profile (strict|dev)")
-	root.PersistentFlags().StringVar(&projectPath, "project", "", "project root path (default: auto-detect)")
+	root.PersistentFlags().StringVar(&projectPath, "project", "", "project root path (default: the launch directory)")
 	root.AddCommand(
 		newInitCmd(),
 		newDoctorCmd(),

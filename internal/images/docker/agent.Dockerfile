@@ -21,13 +21,17 @@ RUN usermod -s /bin/bash node \
 # Install the AEGIS workspace-jail wrapper as /bin/sh.
 # We use mv (atomic rename) to avoid "Text file busy" — the build
 # shell still references the old inode, but new processes get the wrapper.
+# Every path (eval, -s, and plain exec for scripts/interactive sh) lands in
+# bash with the jail rcfile sourced: via the explicit source above, via
+# --rcfile for interactive sessions, or via BASH_ENV for non-interactive
+# bash. Interactive and script "sh" therefore inherit the same cd() boundary.
 RUN cp /bin/sh /bin/sh.real \
 	&& printf '#!/bin/bash\n\
 source /tmp/.aegis-jailrc 2>/dev/null\n\
 case "${1:-}" in\n\
   -c) eval "$2"; exit $? ;;\n\
   -s) shift; cat | bash --rcfile /tmp/.aegis-jailrc; exit $? ;;\n\
-  *) exec /bin/sh.real "$@" ;;\n\
+  *) exec bash --rcfile /tmp/.aegis-jailrc "$@" ;;\n\
 esac\n' > /tmp/sh-jail \
 	&& chmod 755 /tmp/sh-jail \
 	&& mv /tmp/sh-jail /bin/sh

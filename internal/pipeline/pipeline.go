@@ -6,6 +6,12 @@
 //	→ AGENT_FINISHED → SECURITY_SCAN → PREFLIGHT → BLOCK | PASS
 //	→ cleanup / finalize
 //
+// The workspace model is direct-mount: the launch directory (PROJECT_ROOT) is
+// itself the sandbox's /workspace. "SNAPSHOTTING_PROJECT" therefore baselines
+// the live project with an audit manifest (never a copy); the agent edits the
+// real project inside the container, and the verified diff is the session's
+// change set against that baseline.
+//
 // The orchestrator drives real components (sandbox, network gateway, event
 // store, preflight scanners) but declares them through narrow interfaces so
 // the flow can be unit-tested with fakes. It never fakes events: every step
@@ -17,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -135,29 +140,31 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	snap := mgr.Snapshot()
 	res.SessionID = snap.SessionID
 	res.State = snap.State
-	ws := filepath.Join(mgr.Dir(), "workspace")
 
 	// ---------------------------------------------------------- SNAPSHOTTING_PROJECT
+	// Direct-mount model: the launch directory IS the sandbox workspace. The
+	// snapshot phase baselines the live project with an audit manifest for
+	// the verified diff — it never copies project content anywhere. The agent
+	// edits the real project through the container's /workspace mount.
 	if err := mgr.Transition(session.StateSnapshotting, nil); err != nil {
 		return res, err
 	}
-	snapResult, err := workspace.Snapshot(opts.ProjectRoot, ws)
+	ws := opts.ProjectRoot
+	manifest, err := workspace.BuildManifest(ws)
 	if err != nil {
-		return res, fmt.Errorf("snapshot: %w", err)
+		return res, fmt.Errorf("baseline project: %w", err)
 	}
 	if err := mgr.SetWorkspace(ws); err != nil {
 		return res, err
 	}
-	if err := workspace.SaveManifest(mgr.Dir(), snapResult.Manifest); err != nil {
+	if err := workspace.SaveManifest(mgr.Dir(), manifest); err != nil {
 		return res, err
 	}
-	opts.print("workspace:   %s (%d files)\n", ws, snapResult.FilesCopied)
-
-	manifest, _ := workspace.LoadManifest(mgr.Dir())
+	opts.print("workspace:   %s (in place, %d entries baselined)\n", ws, len(manifest))
 
 	// Observation hooks are always injected before the agent starts:
 	// they write .aegis/bin/hook.sh, .claude/settings.json and
-	// .opencode/config.json into the workspace, and the live monitor
+	// .opencode/config.json into the project, and the live monitor
 	// consumes the JSONL they emit.
 	if err := observer.InjectHooks(ws); err != nil {
 		return res, fmt.Errorf("inject observation hooks: %w", err)
@@ -347,7 +354,12 @@ func (opts RunOptions) sandboxFor(mgr *session.Manager, ws string) Sandbox {
 		return sb
 	}
 	sb := sandbox.New(snap.SessionID, ws, mgr.Store())
-	sb.Image = images.AgentImage
+	// The sandbox runs from the minimal hardened runtime image — a pruned
+	// filesystem with no /home, /var, /root, /srv, /opt and with an
+	// unreadable /etc/passwd — enforced by the filesystem itself. The tool
+	// image (images.AgentImage) is only the source the runtime image is
+	// derived from and must never be mounted as the container root.
+	sb.Image = images.RuntimeImage
 	sb.AgentBins = make(map[string]string)
 	for _, name := range agents.ListAvailable() {
 		if a, err := agents.Detect(name); err == nil {

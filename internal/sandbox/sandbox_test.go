@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ type fixtures struct {
 	ExtraHostMount      []json.RawMessage `json:"extra_host_mount"`
 	MissingWorkspace    []json.RawMessage `json:"missing_workspace"`
 	Docker29Flat        []json.RawMessage `json:"docker29_flat"`
+	FatImage            []json.RawMessage `json:"fat_image"`
 }
 
 func loadFixtures(t *testing.T) fixtures {
@@ -96,6 +98,15 @@ func TestVerifyIsolationDetectsMissingWorkspace(t *testing.T) {
 	joined := strings.Join(violations, "; ")
 	if !strings.Contains(joined, "missing required /workspace mount") {
 		t.Fatalf("missing workspace not detected: %v", violations)
+	}
+}
+
+func TestVerifyIsolationRejectsFatToolImage(t *testing.T) {
+	f := loadFixtures(t)
+	violations := VerifyIsolation(wrapArray(t, f.FatImage[0]), "/tmp/ws")
+	joined := strings.Join(violations, "; ")
+	if !strings.Contains(joined, "not the minimal runtime") {
+		t.Fatalf("fat tool image not rejected: %v", violations)
 	}
 }
 
@@ -256,8 +267,11 @@ func TestIntegrationExecInteractive(t *testing.T) {
 	})
 
 	t.Run("shell_commands_work", func(t *testing.T) {
-		// Verify common shell commands work
-		commands := []string{"ls", "pwd", "whoami", "id"}
+		// Verify common shell commands work. The runtime image has no
+		// readable /etc/passwd (agent runs as numeric uid 1000), so
+		// name-lookup utilities like `whoami` intentionally fail while
+		// numeric id and ordinary commands work.
+		commands := []string{"ls", "pwd", "id", "id -u", "bash --version"}
 		for _, cmd := range commands {
 			res, err := sb.Exec(ctx, cmd)
 			if err != nil {
@@ -524,29 +538,32 @@ func TestIntegrationFilesystemBoundary(t *testing.T) {
 		t.Fatalf("SetupWorkspaceJail: %v", err)
 	}
 
-	// --- /etc: agent sees only minimal entries, no root user ---
-	t.Run("etc_passwd_minimal", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "cat /etc/passwd")
+	// --- /etc/passwd + /etc/group: exist for NSS edge cases but are
+	// root-owned 0600, so the agent cannot read them and cannot see any
+	// account data (let alone host accounts or hashes). ---
+	t.Run("etc_passwd_inaccessible", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "cat /etc/passwd 2>&1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := strings.TrimSpace(res.Stdout)
-		if strings.Contains(out, "root:") {
-			t.Errorf("/etc/passwd leaks root entry: %q", out)
+		if res.ExitCode == 0 {
+			t.Errorf("/etc/passwd is readable by the agent: %q", res.Stdout)
 		}
-		if !strings.Contains(out, "node:x:1000:1000::/workspace:/bin/bash") {
-			t.Errorf("/etc/passwd missing minimal node entry: %q", out)
+		out := strings.TrimSpace(res.Stdout + res.Stderr)
+		if strings.Contains(out, "root:") || strings.Contains(out, ":"+":") {
+			t.Errorf("/etc/passwd content leaked to stderr/stdout: %q", out)
 		}
 	})
 
-	t.Run("etc_shadow_empty", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "cat /etc/shadow 2>&1 || true")
+	t.Run("etc_shadow_absent", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "ls /etc/shadow 2>&1 || true")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := strings.TrimSpace(res.Stdout)
-		// /etc/shadow should be empty or inaccessible to uid 1000.
-		// Either outcome means no password hashes are leaked.
+		out := strings.TrimSpace(res.Stdout + res.Stderr)
+		if strings.Contains(out, "No such file") == false {
+			t.Errorf("/etc/shadow should not exist: %q", out)
+		}
 		if strings.Contains(out, "$") || strings.Contains(out, ":root:") {
 			t.Errorf("/etc/shadow leaks sensitive data: %q", out)
 		}
@@ -563,57 +580,54 @@ func TestIntegrationFilesystemBoundary(t *testing.T) {
 		}
 	})
 
-	// --- /root: hidden by tmpfs overlay ---
-	t.Run("root_hidden", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "ls -la /root 2>&1 || true")
+	// --- /root, /home, /var (and the rest of the host tree) do not exist
+	// in the minimal runtime image: any access fails at the filesystem
+	// level, not by policy. ---
+	t.Run("root_absent", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "ls /root 2>&1 || true")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := strings.TrimSpace(res.Stdout)
-		for _, sensitive := range []string{".ssh", ".bashrc", ".bash_history", ".profile"} {
-			if strings.Contains(out, sensitive) {
-				t.Errorf("/root leaks sensitive file %s: %q", sensitive, out)
-			}
+		if !strings.Contains(res.Stdout+res.Stderr, "No such file") {
+			t.Errorf("/root is present in the sandbox: %q", res.Stdout)
 		}
 	})
 
-	t.Run("root_passwd_no_root_user", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "grep root /etc/passwd 2>&1 || true")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(res.Stdout, "root") {
-			t.Errorf("/etc/passwd still contains root user: %q", res.Stdout)
-		}
-	})
-
-	// --- /home: hidden by tmpfs overlay ---
-	t.Run("home_hidden", func(t *testing.T) {
+	t.Run("home_absent", func(t *testing.T) {
 		res, err := sb.Exec(ctx, "ls /home 2>&1 || true")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := strings.TrimSpace(res.Stdout)
-		if strings.Contains(out, "node") || strings.Contains(out, "root") {
-			t.Errorf("/home leaks user directories: %q", out)
+		if !strings.Contains(res.Stdout+res.Stderr, "No such file") {
+			t.Errorf("/home is present in the sandbox: %q", res.Stdout)
 		}
 	})
 
-	// --- /var: hidden by tmpfs overlay ---
-	t.Run("var_hidden", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "ls /var/log 2>&1 || true")
+	t.Run("var_absent", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "ls /var 2>&1 || true")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := strings.TrimSpace(res.Stdout)
-		if strings.Contains(out, "syslog") || strings.Contains(out, "dpkg") {
-			t.Errorf("/var/log leaks host logs: %q", out)
+		if !strings.Contains(res.Stdout+res.Stderr, "No such file") {
+			t.Errorf("/var is present in the sandbox: %q", res.Stdout)
+		}
+	})
+
+	t.Run("opt_srv_absent", func(t *testing.T) {
+		for _, p := range []string{"/opt", "/srv", "/media", "/mnt", "/boot"} {
+			res, err := sb.Exec(ctx, "ls "+p+" 2>&1 || true")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(res.Stdout+res.Stderr, "No such file") {
+				t.Errorf("%s is present in the sandbox: %q", p, res.Stdout)
+			}
 		}
 	})
 
 	// --- cd jail still works ---
 	t.Run("cd_stays_in_workspace", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "cd /workspace && cd .. && pwd")
+		res, err := sb.Exec(ctx, "cd /workspace; cd ..; pwd")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -623,7 +637,7 @@ func TestIntegrationFilesystemBoundary(t *testing.T) {
 	})
 
 	t.Run("cd_root_stays_in_workspace", func(t *testing.T) {
-		res, err := sb.Exec(ctx, "cd / && pwd")
+		res, err := sb.Exec(ctx, "cd /; pwd")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -715,4 +729,469 @@ func TestIntegrationFilesystemBoundary(t *testing.T) {
 				res.ExitCode, combined)
 		}
 	})
+}
+
+// TestIntegrationMinimalRuntimeBoundary is the live contract for the
+// filesystem-level boundary enforced by the minimal runtime image
+// (images.RuntimeImage): outside /workspace nothing sensitive EXISTS or is
+// readable, and nothing can be reached by absolute path, relative ".." walk
+// or symlink — including the user's exact checklist.
+func TestIntegrationMinimalRuntimeBoundary(t *testing.T) {
+	requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	parent := t.TempDir()
+	project := filepath.Join(parent, "proj")
+	if err := os.MkdirAll(project, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileHost(t, filepath.Join(parent, "outside.txt"), "HOST-SECRET", 0644)
+	_ = os.MkdirAll(filepath.Join(project, "src"), 0755)
+	writeFileHost(t, filepath.Join(project, "src", "a.py"), "x=1\n", 0644)
+
+	sb := New("min-runtime-0000-0000-0000-000000000000", project, nil)
+	if err := sb.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Kill(ctx)
+	if err := sb.SetupWorkspaceJail(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The running container must use the minimal runtime image.
+	rawInspect, err := sb.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("runtime_image_in_use", func(t *testing.T) {
+		items, err := ParseInspect(rawInspect)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if img := items[0].Config.Image; !strings.HasPrefix(img, runtimeImagePrefix) {
+			t.Errorf("container is not running the minimal runtime image, got %q", img)
+		}
+		if v := VerifyIsolation(rawInspect, project); len(v) != 0 {
+			t.Errorf("running container violates isolation: %v", v)
+		}
+	})
+
+	// User's critical checklist: every escape path must fail at the
+	// filesystem level (rc != 0), not by policy messaging. Two exceptions
+	// are still stricts: `ls /tmp` succeeds but must show an empty private
+	// tmpfs, and `ls /workspace/..` succeeds but must show only the minimal
+	// runtime tree (covered by workspace_parent_is_minimal below).
+	t.Run("user_checklist_denied_at_fs_level", func(t *testing.T) {
+		mustFail := map[string]string{
+			"cat /workspace/../outside.txt":    "trailing-parent escape",
+			"cat /workspace/../../outside.txt": "double-parent escape",
+			"cat ../outside.txt":               "cwd relative escape",
+			"cat ../../outside.txt":            "cwd double-relative escape",
+			"cat /etc/passwd":                  "host passwd",
+			"ls /home":                         "home",
+			"ls /home/user":                    "home user dir",
+			"ls /root":                         "root home",
+			"find /home":                       "home walk",
+		}
+		for probe, label := range mustFail {
+			res, err := sb.Exec(ctx, probe+" >/dev/null 2>&1; echo rc=$?")
+			if err != nil {
+				t.Fatalf("%s: exec failed: %v", label, err)
+			}
+			out := strings.TrimSpace(res.Stdout)
+			// Expected outcomes: rc=2 for removed paths (ENOENT), rc=1 for
+			// filesystem permission denials. Any rc=0 with content is a leak.
+			if strings.Contains(out, "rc=0") {
+				t.Errorf("%s: %q returned rc=0", label, probe)
+			}
+			if strings.Contains(out, "outside.txt") || strings.Contains(out, "outside") {
+				t.Errorf("%s: leaked file content at %q: %s", label, probe, out)
+			}
+		}
+		for _, probe := range []string{"ls /tmp", "find /tmp"} {
+			res, err := sb.Exec(ctx, probe+" 2>&1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range strings.Fields(res.Stdout) {
+				base := strings.TrimSuffix(path.Base(e), "/")
+				if base != "." && base != ".." && base != "/" && base != ".aegis-jailrc" && base != "tmp" {
+					t.Errorf("%s must be a private empty tree, got %q (full %v)", probe, e, strings.Fields(res.Stdout))
+				}
+			}
+		}
+	})
+
+	t.Run("workspace_parent_is_minimal", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "ls -1 /workspace/.. 2>&1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Fields(res.Stdout)
+		allowed := map[string]bool{
+			"agent": true, "bin": true, "dev": true, "etc": true,
+			"lib": true, "lib64": true, "proc": true, "run": true,
+			"sbin": true, "sys": true, "tmp": true, "usr": true,
+			"workspace": true, ".dockerenv": true,
+		}
+		for _, e := range got {
+			if !allowed[e] {
+				t.Errorf("/workspace/.. contains unexpected entry %q (full list %v)", e, got)
+			}
+		}
+		if len(got) == 0 {
+			t.Error("/workspace/.. is empty: expected at least the minimal runtime root")
+		}
+	})
+
+	t.Run("find_root_only_minimal", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "find / -maxdepth 1 2>/dev/null | sort")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Fields(res.Stdout)
+		allowed := map[string]bool{
+			"agent": true, "bin": true, "dev": true, "etc": true,
+			"lib": true, "lib64": true, "proc": true, "run": true,
+			"sbin": true, "sys": true, "tmp": true, "usr": true,
+			"workspace": true, "/": true, ".dockerenv": true,
+		}
+		for _, e := range got {
+			key := e
+			if e != "/" {
+				key = strings.TrimLeft(e, "/")
+			}
+			if !allowed[key] {
+				t.Errorf("find / leaked entry %q (full %v)", e, got)
+			}
+		}
+		if len(got) == 0 {
+			t.Error("find / produced no output")
+		}
+	})
+
+	t.Run("agent_cache_agent_owned_writable", func(t *testing.T) {
+		// Regression: opencode crashed at startup with
+		// `EACCES: permission denied, mkdir '/agent/cache/.local'` because
+		// the tmpfs over /agent/cache was root-owned 0755. The mount must
+		// be pinned to the agent uid with mode 0700.
+		res, err := sb.Exec(ctx, "stat -c '%A %u:%g' /agent/cache; mkdir -p /agent/cache/.local /agent/cache/.config && touch /agent/cache/.local/probe && printf 'x\\n' > /agent/cache/.config/c && rm /agent/cache/.local/probe && echo AGENT-CACHE-OK")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := strings.TrimSpace(res.Stdout)
+		fields := strings.Fields(out)
+		if len(fields) == 0 {
+			t.Fatalf("no stat output: %q", out)
+		}
+		mode := fields[0]
+		if !(strings.HasPrefix(mode, "-rwx") || strings.HasPrefix(mode, "drwx")) {
+			t.Errorf("/agent/cache mode = %s, want agent-writable (0700)", mode)
+		}
+		if mode[2] != 'w' {
+			t.Errorf("/agent/cache is not owner-writable: %s", mode)
+		}
+		if mode[4] == 'r' || mode[5] == 'w' || mode[7] == 'r' {
+			t.Errorf("/agent/cache is too permissive (group/other readable): %s", mode)
+		}
+		if !strings.HasPrefix(fields[1], "1000:") {
+			t.Errorf("/agent/cache owner = %s, want uid 1000", fields[1])
+		}
+		if !strings.Contains(out, "AGENT-CACHE-OK") {
+			t.Errorf("agent could not create .local/.config under /agent/cache: %q", out)
+		}
+	})
+
+	t.Run("tmp_is_private_empty_tmpfs", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "ls -1 /tmp 2>&1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Fields(res.Stdout)
+		if len(got) != 0 {
+			t.Errorf("/tmp should be empty, contains %v", got)
+		}
+	})
+
+	t.Run("symlink_escapes_blocked", func(t *testing.T) {
+		probes := map[string]string{
+			`ln -sf /etc/passwd /workspace/link1 && cat /workspace/link1`:               "to /etc/passwd",
+			`ln -sf /home /workspace/link2 && ls /workspace/link2`:                      "to /home",
+			`ln -sf / /workspace/link3 && ls /workspace/link3`:                          "to /",
+			`ln -sf /workspace/../outside.txt /workspace/link4 && cat /workspace/link4`: "to ../outside.txt",
+			`ln -sf ../../../etc/passwd /workspace/link5 && cat /workspace/link5`:       "deep-relative to /etc/passwd",
+		}
+		for probe, label := range probes {
+			res, err := sb.Exec(ctx, probe+" >/dev/null 2>&1; echo rc=$?")
+			if err != nil {
+				t.Fatalf("symlink %s: exec failed: %v", label, err)
+			}
+			if strings.Contains(res.Stdout, "HOST-SECRET") {
+				t.Errorf("symlink %s leaked host data", label)
+			}
+			if strings.Contains(res.Stdout, "root:x:") || strings.Contains(res.Stdout, "node:x:") {
+				t.Errorf("symlink %s leaked passwd data", label)
+			}
+		}
+	})
+
+	t.Run("symlink_created_after_startup", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "cd /workspace && ln -sf / /workspace/escape-root && ls /workspace/escape-root/ >>/dev/null 2>&1 && cat /workspace/escape-root/workspace/../outside.txt 2>&1; echo rc=$?")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(res.Stdout, "HOST-SECRET") {
+			t.Error("post-start symlink to / escaped to host data")
+		}
+	})
+
+	// CRUD under /workspace keeps working (the project remains fully
+	// usable for the agent).
+	t.Run("crud_inside_workspace_works", func(t *testing.T) {
+		res, err := sb.Exec(ctx, "mkdir -p /workspace/newdir && printf 'c=2\\n' > /workspace/newdir/c.txt && cat /workspace/newdir/c.txt && rm /workspace/src/a.py && test ! -e /workspace/src/a.py && echo CRUD-OK")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.Stdout, "CRUD-OK") {
+			t.Errorf("in-project CRUD failed: %q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "c=2") {
+			t.Errorf("created file content missing: %q", res.Stdout)
+		}
+	})
+}
+
+// TestIntegrationProjectRootMountDirect is the live direct-mount contract:
+// an arbitrary launch directory is mounted AS /workspace, the bind mount
+// source is exactly that directory, and files created by the agent inside the
+// container appear immediately in the original project directory on the host.
+// No separate workspace copy exists anywhere.
+func TestIntegrationProjectRootMountDirect(t *testing.T) {
+	requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := EnsureAgentImage(ctx); err != nil {
+		t.Fatalf("image: %v", err)
+	}
+
+	// An "arbitrary" project directory, exactly as if launched from it.
+	projectRoot := t.TempDir()
+	writeFileHost(t, filepath.Join(projectRoot, "README.md"), "direct-mount project\n", 0o644)
+	parent := filepath.Dir(projectRoot)
+	writeFileHost(t, filepath.Join(parent, "host-secret.txt"), "DO NOT LEAK", 0o600)
+	// Deliberately no "<state>/sessions/<id>/workspace" copy anywhere.
+	stateRoot := t.TempDir()
+
+	sb := New("mount-direct-0000-0000-000000000001", projectRoot, nil)
+	if err := sb.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sb.Kill(context.Background())
+	if err := sb.SetupWorkspaceJail(); err != nil {
+		t.Fatalf("SetupWorkspaceJail: %v", err)
+	}
+
+	// 1. The bind mount source is EXACTLY the project root.
+	raw, err := sb.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := ParseInspect(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectAbs, _ := filepath.Abs(projectRoot)
+	var bindMounts int
+	for _, m := range items[0].Mounts {
+		if m.Type == "bind" {
+			bindMounts++
+			if m.Destination != "/workspace" {
+				t.Errorf("unexpected bind mount destination %s <- %s", m.Destination, m.Source)
+			}
+			if src, _ := filepath.Abs(m.Source); src != projectAbs {
+				t.Errorf("bind source %q != project %q", m.Source, projectAbs)
+			}
+			if !m.RW {
+				t.Error("/workspace bind mount is not read-write")
+			}
+		}
+	}
+	if bindMounts != 1 {
+		t.Errorf("expected exactly one bind mount (/workspace <- project), got %d", bindMounts)
+	}
+	if violations := VerifyIsolation(raw, projectRoot); len(violations) > 0 {
+		t.Fatalf("live container violates isolation: %v", violations)
+	}
+
+	// 2. Container reads the project's original content.
+	res, err := sb.Exec(ctx, "cat /workspace/README.md")
+	if err != nil || strings.TrimSpace(res.Stdout) != "direct-mount project" {
+		t.Fatalf("project content not visible at /workspace: %q %v %q", res.Stdout, err, res.Stderr)
+	}
+
+	// 3. Agent-created files land in the ORIGINAL project directory.
+	if _, err := sb.Exec(ctx, "mkdir -p /workspace/src && echo 'fn main(){}' > /workspace/src/main.rs"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(projectRoot, "src", "main.rs"))
+	if err != nil || !strings.Contains(string(b), "fn main(){}") {
+		t.Fatalf("agent file missing from original project dir: %q %v", b, err)
+	}
+
+	// 4. The parent directory (with its secret) stays unreachable through
+	// the mount boundary and through a symlink planted from inside.
+	probes := []string{
+		"cat /workspace/../host-secret.txt 2>&1",
+		"cat /../host-secret.txt 2>&1",
+	}
+	for _, p := range probes {
+		res, _ := sb.Exec(ctx, p)
+		if strings.Contains(res.Stdout, "DO NOT LEAK") {
+			t.Errorf("HOST PARENT DATA READ VIA %s", p)
+		}
+	}
+	link, _ := sb.Exec(ctx, "ln -s ../host-secret.txt /workspace/dangling && cat /workspace/dangling 2>&1")
+	if strings.Contains(link.Stdout, "DO NOT LEAK") {
+		t.Error("host secret reached through relative-escape symlink")
+	}
+	absLink, _ := sb.Exec(ctx, "ln -s /etc/passwd /workspace/abslink && cat /workspace/abslink 2>&1")
+	if strings.Contains(absLink.Stdout, "root:") || strings.Contains(absLink.Stdout, "DO NOT LEAK") {
+		t.Errorf("/workspace/abslink reached host /etc/passwd: %q", absLink.Stdout)
+	}
+
+	// 5. No workspace copy directory was ever created under the state root.
+	var copies []string
+	_ = filepath.WalkDir(stateRoot, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && d.Name() == "workspace" {
+			copies = append(copies, path)
+		}
+		return nil
+	})
+	if len(copies) != 0 {
+		t.Fatalf("a copied workspace dir exists under state root: %v", copies)
+	}
+}
+
+// TestIntegrationCdNavigationAndBoundary is the precise navigation contract:
+// interior navigation works anywhere inside the project (cd src; cd ..; cd
+// tests; cd ../src), while every attempt above/through the boundary — cd .. at
+// /workspace, cd /workspace/../src, cd /, cd ~ (HOME=/home/node) — is refused
+// and the shell ends up where it was.
+func TestIntegrationCdNavigationAndBoundary(t *testing.T) {
+	requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := EnsureAgentImage(ctx); err != nil {
+		t.Fatalf("image: %v", err)
+	}
+
+	projectRoot := t.TempDir()
+	sb := New("cd-navigation-0000-0000-000000000001", projectRoot, nil)
+	if err := sb.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sb.Kill(context.Background())
+	if err := sb.SetupWorkspaceJail(); err != nil {
+		t.Fatalf("SetupWorkspaceJail: %v", err)
+	}
+
+	allowed := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"cd into subdir", "mkdir -p /workspace/src; cd /workspace/src; cd ..; pwd", "/workspace"},
+		{"cd up from subdir to root", "mkdir -p /workspace/src; cd /workspace/src; cd ..; cd ..; pwd", "/workspace"},
+		{"cd down then sibling via ..", "mkdir -p /workspace/tests; cd /workspace/src; cd ..; cd tests; cd ../src; pwd", "/workspace/src"},
+		{"deep relative nav", "mkdir -p /workspace/a/b/c; cd /workspace/a/b/c; cd ../../b/c; pwd", "/workspace/a/b/c"},
+		{"cd - returns to previous dir", "cd /workspace; mkdir -p /workspace/x; cd /workspace/x; cd - >/dev/null; pwd", "/workspace"},
+	}
+	for _, tc := range allowed {
+		res, err := sb.Exec(ctx, tc.cmd)
+		if err != nil {
+			t.Fatalf("%s: exec error: %v", tc.name, err)
+		}
+		if got := strings.TrimSpace(res.Stdout); got != tc.want {
+			t.Errorf("%s: pwd = %q, want %q (stderr %q)", tc.name, got, tc.want, res.Stderr)
+		}
+	}
+
+	blocked := []struct {
+		name string
+		cmd  string
+	}{
+		{"cd .. at workspace root", "cd /workspace; cd ..; pwd"},
+		{"cd .. twice at root", "cd /workspace; cd ..; cd ..; pwd"},
+		{"cd /workspace/../src", "cd /workspace/../src 2>&1; pwd"},
+		{"cd /", "cd /; pwd"},
+		{"cd ~", "cd ~ 2>&1; pwd"},
+		{"cd /home", "cd /home 2>&1; pwd"},
+		{"cd /etc", "cd /etc 2>&1; pwd"},
+		{"cd /tmp", "cd /tmp 2>&1; pwd"},
+	}
+	for _, tc := range blocked {
+		res, err := sb.Exec(ctx, tc.cmd)
+		if err != nil {
+			t.Fatalf("%s: exec error: %v", tc.name, err)
+		}
+		lines := strings.Fields(strings.TrimSpace(res.Stdout))
+		last := ""
+		if len(lines) > 0 {
+			last = lines[len(lines)-1]
+		}
+		if last != "/workspace" {
+			t.Errorf("%s: escaped boundary, final pwd = %q (stderr %q)", tc.name, last, res.Stderr)
+		}
+	}
+}
+
+// TestIntegrationAgentBinMountsPassIsolation verifies VerifyIsolation accepts
+// the documented read-only agent-tool chain mounts (a real binary under
+// /usr/local/bin plus its ldd libraries) while still flagging unknown host
+// paths — so production runs with AgentBins set are not mis-reported.
+func TestIntegrationAgentBinMountsPassIsolation(t *testing.T) {
+	requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := EnsureAgentImage(ctx); err != nil {
+		t.Fatalf("image: %v", err)
+	}
+
+	probeBin, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not found for mount probe")
+	}
+	projectRoot := t.TempDir()
+	sb := New("agent-mounts-0000-0000-000000000001", projectRoot, nil)
+	sb.AgentBins = map[string]string{"probe-agent": probeBin}
+	if err := sb.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sb.Kill(context.Background())
+
+	raw, err := sb.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if violations := VerifyIsolation(raw, projectRoot); len(violations) > 0 {
+		t.Fatalf("agent-tool mounts wrongly flagged: %v", violations)
+	}
+	res, err := sb.Exec(ctx, "test -x /usr/local/bin/probe-agent && echo MOUNTED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Stdout, "MOUNTED") {
+		t.Errorf("probe agent bin not mounted into PATH: %q", res.Stdout)
+	}
+}
+
+func writeFileHost(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
 }

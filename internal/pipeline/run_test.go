@@ -370,6 +370,71 @@ func TestRunPipelineShellBlockStops(t *testing.T) {
 	}
 }
 
+// TestRunPipelineMountsProjectDirectly is the core contract test of the
+// boundary change: the sandbox workspace handed to NewSandbox is the launch
+// directory itself, so the container mounts the real project at /workspace,
+// files created by the agent appear in the original project directory, and no
+// separate aegis-workspace copy directory is ever created under the session
+// state root.
+func TestRunPipelineMountsProjectDirectly(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "main.go", "package main\n\nfunc main() {}\n")
+
+	stateRoot := t.TempDir()
+	sandboxWorkspace := ""
+	sb := &fakeSandbox{}
+	sb.sid = "bbbbbbbb-0000-0000-0000-000000000000"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "test-agent",
+		Profile:     "strict",
+		StateRoot:   stateRoot,
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox: func(sid, ws string, s *events.Store) pipeline.Sandbox {
+			sandboxWorkspace = ws
+			sb.sid = sid
+			sb.ws = ws
+			return sb
+		},
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int { return 0 },
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		},
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != session.StatePass {
+		t.Fatalf("state = %s, want %s", res.State, session.StatePass)
+	}
+	if sandboxWorkspace != projectRoot {
+		t.Fatalf("sandbox workspace = %q, want the project root %q", sandboxWorkspace, projectRoot)
+	}
+	sessions := loadSessions(t, stateRoot)
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].Workspace != projectRoot {
+		t.Errorf("meta.Workspace = %q, want %q", sessions[0].Workspace, projectRoot)
+	}
+	if sessions[0].ProjectRoot != projectRoot {
+		t.Errorf("meta.ProjectRoot = %q, want %q", sessions[0].ProjectRoot, projectRoot)
+	}
+	// No aegis-workspace copy directory may be created under the session dir.
+	workspaceDirs, _ := filepath.Glob(filepath.Join(stateRoot, "sessions", "*", "workspace"))
+	if len(workspaceDirs) != 0 {
+		t.Fatalf("session state must not contain a copied workspace dir: %v", workspaceDirs)
+	}
+	// The audit manifest still exists at the session root.
+	if _, err := os.Stat(filepath.Join(stateRoot, "sessions", sessions[0].SessionID, "manifest.json")); err != nil {
+		t.Errorf("audit manifest not written: %v", err)
+	}
+}
+
 func loadSessions(t *testing.T, stateRoot string) []session.Metadata {
 	t.Helper()
 	dir := filepath.Join(stateRoot, "sessions")

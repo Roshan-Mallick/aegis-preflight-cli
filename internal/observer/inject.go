@@ -13,18 +13,19 @@ var hookScript string
 //go:embed assets/settings.hooks.json
 var settingsJSON string
 
-//go:embed assets/opencode.hooks.json
-var opencodeHooksJSON string
+//go:embed assets/opencode.plugin.js
+var opencodePluginJS string
 
 const (
-	hookBinDir     = ".aegis/bin"
-	rawLogDir      = ".aegis/raw"
-	rawLogName     = "hooks.jsonl"
-	claudeDir      = ".claude"
-	claudeSettings = "settings.json"
-	opencodeDir    = ".opencode"
-	opencodeConfig = "config.json"
-	HookPath       = "/workspace/.aegis/bin/hook.sh"
+	hookBinDir       = ".aegis/bin"
+	rawLogDir        = ".aegis/raw"
+	rawLogName       = "hooks.jsonl"
+	claudeDir        = ".claude"
+	claudeSettings   = "settings.json"
+	opencodeDir      = ".opencode"
+	opencodePlugins  = "plugins"
+	opencodePlugin   = "aegis.js"
+	HookPath         = "/workspace/.aegis/bin/hook.sh"
 )
 
 func RawLogPath(workspace string) string {
@@ -68,16 +69,16 @@ func injectClaudeHooks(workspace string) error {
 }
 
 func injectOpenCodeHooks(workspace string) error {
-	dir := filepath.Join(workspace, opencodeDir)
+	dir := filepath.Join(workspace, opencodeDir, opencodePlugins)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create .opencode dir: %w", err)
+		return fmt.Errorf("create .opencode plugins dir: %w", err)
 	}
-	if existing, err := os.ReadFile(filepath.Join(dir, opencodeConfig)); err == nil && len(existing) > 0 {
-		backup := filepath.Join(dir, opencodeConfig+".aegis-backup")
+	if existing, err := os.ReadFile(filepath.Join(dir, opencodePlugin)); err == nil && len(existing) > 0 {
+		backup := filepath.Join(dir, opencodePlugin+".aegis-backup")
 		if err := os.WriteFile(backup, existing, 0o600); err != nil {
-			return fmt.Errorf("back up existing opencode config: %w", err)
+			return fmt.Errorf("back up existing opencode plugin: %w", err)
 		}
 	}
-	path := filepath.Join(dir, opencodeConfig)
-	return os.WriteFile(path, []byte(opencodeHooksJSON), 0o600)
+	path := filepath.Join(dir, opencodePlugin)
+	return os.WriteFile(path, []byte(opencodePluginJS), 0o600)
 }

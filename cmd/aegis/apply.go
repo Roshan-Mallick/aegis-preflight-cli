@@ -13,7 +13,7 @@ import (
 func newApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply [session-id]",
-		Short: "Apply a PASS session diff to the trusted project (explicit user action)",
+		Short: "Validate and record a PASS session promotion (changes are already in the project)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := ""
@@ -53,9 +53,13 @@ func newApplyCmd() *cobra.Command {
 				fmt.Println("no changes to apply; session produced an empty diff")
 				return nil
 			}
-			n, err := workspace.Apply(meta.ProjectRoot, meta.Workspace, before, changes)
-			if err != nil {
-				return fmt.Errorf("promotion failed after %d change(s): %w", n, err)
+			// In the direct-mount model the workspace IS the project: the
+			// agent's changes already live in the project directory, so
+			// promotion is a validation and audit-recording step, never a
+			// copy. Security validation still refuses illegal paths and
+			// escaping symlinks before the session is closed as "applied".
+			if err := workspace.ValidatePromotion(meta.ProjectRoot, before, changes); err != nil {
+				return fmt.Errorf("promotion refused: %w", err)
 			}
 			if err := workspace.SaveManifest(mgr.Dir(), current); err != nil {
 				return err
@@ -72,7 +76,10 @@ func newApplyCmd() *cobra.Command {
 			if err := mgr.SetOutcome("applied"); err != nil {
 				return err
 			}
-			fmt.Printf("applied %d change(s) from session %s to %s\n", n, id, meta.ProjectRoot)
+			fmt.Printf("promoted %d change(s) from session %s\n", len(changes), id)
+			if meta.Workspace == meta.ProjectRoot {
+				fmt.Printf("  (in-place workspace: changes already live in %s)\n", meta.ProjectRoot)
+			}
 			for _, ch := range changes {
 				fmt.Printf("  %-13s %s\n", ch.Kind, ch.Path)
 			}

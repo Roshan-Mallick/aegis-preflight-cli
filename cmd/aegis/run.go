@@ -33,7 +33,11 @@ launch AI agents (opencode, claude) from within the sandbox.
 
 With arguments, executes the command inside the sandbox and returns.
 
-The filesystem is restricted to the current project workspace.
+The directory you launch from (PROJECT_ROOT) is the security boundary.
+It is mounted directly into the hardened container as /workspace: you get
+full read/write access and normal navigation (cd .., creating, editing,
+deleting files) inside the project, and nothing outside it — your home
+directory, sibling projects, the host filesystem — is visible or reachable.
 Network access is restricted by default (strict mode).
 
 The pipeline is fully orchestrated: entry gate, sandbox, simultaneous
@@ -54,7 +58,7 @@ Examples:
 		},
 	}
 	cmd.Flags().StringVar(&netProfile, "net", "", "network profile (strict|dev); default strict")
-	cmd.Flags().StringVar(&projectPath, "project", "", "project root path (default: auto-detect from cwd)")
+	cmd.Flags().StringVar(&projectPath, "project", "", "project root path (default: the launch directory itself)")
 	cmd.Flags().StringVar(&uiMode, "ui", "", "interactive UI (split|passthrough); default split on a TTY")
 	return cmd
 }
@@ -130,8 +134,8 @@ func printBlocked(mgr *session.Manager, final *preflight.FinalResult) {
 		fmt.Fprintf(os.Stderr, "  [%s] %s:%d rule=%s\n    %s\n",
 			strings.ToUpper(f.Severity), loc, f.Line, f.Rule, f.Message)
 	}
-	fmt.Fprintf(os.Stderr, "\nA fix request has been written to the workspace.\n")
-	fmt.Fprintf(os.Stderr, "Fix the issues and run 'aegis run' again.\n")
+	fmt.Fprintf(os.Stderr, "\nThe flagged changes were left in your project directory (%s) and are BLOCKED.\n", snap.ProjectRoot)
+	fmt.Fprintf(os.Stderr, "Fix the issues directly (they are already in place) and run 'aegis run' again.\n")
 	fmt.Fprintf(os.Stderr, "View details: aegis preflight %s\n", shortID(snap.SessionID))
 }
 
@@ -164,8 +168,8 @@ func printPassed(mgr *session.Manager, final *preflight.FinalResult) {
 	fmt.Fprintf(os.Stderr, "Session:     %s\n", shortID(snap.SessionID))
 	fmt.Fprintf(os.Stderr, "Cycles:      %d\n", final.Cycles)
 	fmt.Fprintf(os.Stderr, "Scanners:    %s\n", strings.Join(final.Last.ScannersRun, ", "))
-	fmt.Fprintf(os.Stderr, "\nSession is ready for promotion.\n")
-	fmt.Fprintf(os.Stderr, "Run 'aegis apply %s' to promote changes to your project.\n", shortID(snap.SessionID))
+	fmt.Fprintf(os.Stderr, "\nSession is verified. Changes already live in your project (%s).\n", snap.ProjectRoot)
+	fmt.Fprintf(os.Stderr, "Run 'aegis apply %s' to validate and record the promotion.\n", shortID(snap.SessionID))
 }
 
 func detectAgentName(args []string) string {
@@ -225,26 +229,49 @@ func writeModelFindingsMD(sessionDir, sessionID string, resp *model.Response) er
 	return os.WriteFile(sessionDir+"/model-analysis.md", []byte(md), 0o600)
 }
 
+// isAgentName reports whether the detected command is a real CLI coding
+// agent (opencode/claude/codex). Those agents render their own native
+// full-screen terminal UI, so they are routed to the passthrough entry
+// point rather than AEGIS's embedded split TUI. Bare shells and arbitrary
+// commands ("shell", "bash", "sh", or any other command) are not agents.
+func isAgentName(agentName string) bool {
+	switch agentName {
+	case "opencode", "claude", "codex":
+		return true
+	}
+	return false
+}
+
 // interactiveFor selects the sandbox interactive entry point. passthrough
-// uses a full-screen terminal passthrough; split runs the embedded TUI
-// (interactive PTY pane + security feed + status bar). auto prefers split
-// when a terminal is present, otherwise passthrough.
+// (nil return) uses a full-screen terminal passthrough so a CLI agent renders
+// its own native UI; split runs the embedded TUI (interactive PTY pane +
+// security feed + status bar). auto prefers split when a terminal is present
+// and the command is not an agent, otherwise passthrough. The default ("")
+// follows the same rule: native passthrough for agents, otherwise split on a
+// terminal.
 func interactiveFor(uiMode string, args []string, agentName, profile string) pipeline.InteractiveFunc {
+	if interactiveUsesSplit(uiMode, termIsTTY(), isAgentName(agentName)) {
+		return splitTUIInteractive(args, agentName, profile)
+	}
+	return nil
+}
+
+// interactiveUsesSplit is the pure routing decision behind interactiveFor: it
+// reports whether the given UI mode should use AEGIS's embedded split TUI
+// rather than the full-screen passthrough. It is separated out so the TTY and
+// agent-routing behaviour can be unit-tested without a real terminal.
+func interactiveUsesSplit(uiMode string, isTTY, agentRun bool) bool {
 	switch uiMode {
 	case "passthrough", "none":
-		return nil
-	case "split", "auto":
-		if uiMode == "auto" && !termIsTTY() {
-			return nil
-		}
-		return splitTUIInteractive(args, agentName, profile)
+		return false
+	case "split":
+		return true
+	case "auto":
+		return isTTY && !agentRun
 	case "":
-		if termIsTTY() {
-			return splitTUIInteractive(args, agentName, profile)
-		}
-		return nil
+		return isTTY && !agentRun
 	default:
-		return nil
+		return false
 	}
 }
 

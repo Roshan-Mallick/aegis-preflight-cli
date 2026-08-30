@@ -94,8 +94,8 @@ func newPreflightCmd() *cobra.Command {
 				if err := mgr.SetOutcome("blocked"); err != nil {
 					return err
 				}
-				fmt.Println("PREFLIGHT BLOCKED — session BLOCKED; changes will NOT be promoted")
-				return fmt.Errorf("PREFLIGHT BLOCKED after %d cycle(s); changes will NOT be promoted", final.Cycles)
+				fmt.Printf("PREFLIGHT BLOCKED — session BLOCKED; the flagged changes remain in %s\n", snap.ProjectRoot)
+				return fmt.Errorf("PREFLIGHT BLOCKED after %d cycle(s); flagged changes remain in the project, fix and re-run", final.Cycles)
 			}
 
 			// Preflight passed — generate verified diff.
@@ -104,7 +104,7 @@ func newPreflightCmd() *cobra.Command {
 				vd, verr := preflight.GenerateVerifiedDiff(snap.SessionID, before, snap.Workspace, final.Cycles)
 				if verr == nil {
 					if werr := preflight.WriteVerifiedArtifacts(mgr.Dir(), vd); werr == nil {
-						fmt.Printf("verified diff: %d change(s) staged\n", len(vd.Changes))
+						fmt.Printf("verified diff: %d change(s) recorded\n", len(vd.Changes))
 					}
 				}
 			}
@@ -117,7 +117,7 @@ func newPreflightCmd() *cobra.Command {
 			if err := mgr.SetOutcome("verified"); err != nil {
 				return err
 			}
-			fmt.Println("PREFLIGHT PASSED — session PASS; run 'aegis apply' to promote")
+			fmt.Println("PREFLIGHT PASSED — session PASS; run 'aegis apply' to validate and record the change set")
 			return nil
 		},
 	}

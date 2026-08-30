@@ -19,7 +19,11 @@ import (
 )
 
 const (
-	defaultImage    = images.AgentImage
+	// The sandbox container runs from the minimal hardened runtime image
+	// (a pruned filesystem with no /home, /var, /root, /srv, /opt and with
+	// unreadable /etc/passwd). The tool image aegis-agent:v1 is only the
+	// source that the runtime image is derived from.
+	defaultImage    = images.RuntimeImage
 	containerPrefix = "aegis-agent-"
 	memoryLimit     = "2g"
 	cpuLimit        = "2"
@@ -123,6 +127,21 @@ func (s *Sandbox) emit(typ, severity string, data map[string]any) {
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {
+	// The sandbox images must exist before the container is launched. This
+	// is cheap when nothing changed: the runtime image carries a fingerprint
+	// of the tool image it was derived from and is only rebuilt when the
+	// tool image changes.
+	imgCtx, imgCancel := context.WithTimeout(ctx, 12*time.Minute)
+	if err := EnsureAgentImage(imgCtx); err != nil {
+		imgCancel()
+		return err
+	}
+	if err := EnsureRuntimeImage(imgCtx); err != nil {
+		imgCancel()
+		return err
+	}
+	imgCancel()
+
 	_ = s.killStale(ctx)
 	wsAbs, err := absPath(s.Workspace)
 	if err != nil {
@@ -146,31 +165,27 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		"--memory", memoryLimit,
 		"--cpus", cpuLimit,
 		"--pids-limit", pidsLimit,
-		// Filesystem boundary: read-only root + tmpfs overlays hide
-		// /root, /home, /var, /boot from the agent. /etc is hardened
-		// at image-build time (minimal passwd/shadow/group baked in,
-		// TLS certs preserved). Binaries in /bin and /usr/bin remain
-		// visible (read-only) so bash, git, python3, opencode etc.
-		// continue to work.
+		// Filesystem boundary. The container root is the minimal runtime
+		// image (images.RuntimeImage), a pruned filesystem that contains no
+		// /home, /var, /root, /srv, /opt and an unreadable /etc/passwd, so
+		// /workspace/.., absolute paths, relative ".." walks and symlinks
+		// can only ever resolve inside the held project or the strictly
+		// minimal runtime. --read-only makes the whole runtime immutable.
+		// The only writable area is the project itself: /workspace (rw
+		// bind). /tmp and /run are empty private tmpfs mountpoints, and
+		// /agent/cache is the exec-capable scratch space for agent
+		// runtimes (see TMPDIR/HOME below). Docker mounts a tmpfs over
+		// /agent/cache as root; uid/gid/mode pin it to the agent user so
+		// the non-root agent can actually write there (opencode creates
+		// /agent/cache/.local and /agent/cache/.config at startup).
 		"--read-only",
-		"--tmpfs", "/root:rw,noexec,nosuid,size=1m",
-		// /home must be writable by the agent uid (docker's default tmpfs
-		// mode is 0700 root-only). Agent runtimes (opencode is a Bun
-		// binary) honor HOME; without a writable home they fall back to the
-		// /etc/passwd home (/workspace) and drop their secret-bearing
-		// runtime DB *inside* the scanned workspace. mode=1777 keeps the
-		// mount noexec while allowing node (uid 1000) to create ~/.local.
-		"--tmpfs", "/home:rw,noexec,nosuid,size=256m,mode=1777",
-		"--tmpfs", "/var:rw,noexec,nosuid,size=10m",
-		"--tmpfs", "/boot:rw,noexec,nosuid,size=1m",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=100m",
-		"--tmpfs", "/var/tmp:rw,noexec,nosuid,size=100m",
-		// Agents (opencode etc.) JIT-extract native render libraries that
-		// must be mmapped PROT_EXEC; the noexec /tmp above would break them.
-		// Give them a small exec-capable scratch space and point TMPDIR there.
-		"--tmpfs", "/agent/cache:rw,exec,nosuid,nodev,size=128m",
+		"--tmpfs", "/run:rw,nosuid,nodev,size=8m",
+		"--tmpfs", "/agent/cache:rw,exec,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=0700",
 		"-e", "TMPDIR=/agent/cache",
+		"-e", "HOME=/agent/cache",
 		"-e", "BASH_ENV=/tmp/.aegis-jailrc",
+		"-w", "/workspace",
 		"-v", wsAbs+":/workspace",
 	)
 
@@ -202,13 +217,14 @@ func (s *Sandbox) Start(ctx context.Context) error {
 	if s.AgentData != "" {
 		args = append(args,
 			"-v", s.AgentData+":/agent/data",
-			"-e", "HOME=/home/node",
 			"-e", "XDG_DATA_HOME=/agent/data",
 			"-e", "XDG_CONFIG_HOME=/agent/config",
 		)
 	}
 
-	args = append(args, s.Image)
+	// The imported runtime image has no CMD; sleep keeps the container
+	// alive so docker exec can drive the sandbox.
+	args = append(args, "--entrypoint", "/usr/bin/sleep", s.Image, "infinity")
 	out, err := docker(runCtx, args...)
 	if err != nil {
 		s.emit("sandbox.start", events.SevHigh, map[string]any{"error": trim(out)})
@@ -233,7 +249,7 @@ func (s *Sandbox) killStale(ctx context.Context) error {
 func (s *Sandbox) Exec(ctx context.Context, command string) (ExecResult, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	args := []string{"exec", "-i", s.Name, "sh", "-c", command}
+	args := []string{"exec", "-i", "-w", "/workspace", s.Name, "sh", "-c", command}
 	bin, err := exec.LookPath("docker")
 	if err != nil {
 		return ExecResult{}, err
@@ -260,23 +276,45 @@ func (s *Sandbox) Exec(ctx context.Context, command string) (ExecResult, error) 
 }
 
 func (s *Sandbox) SetupWorkspaceJail() error {
-	// /etc is hardened at image-build time (minimal passwd/shadow/group,
-	// TLS certs preserved).  We only need to place the jail rcfile where
-	// the /bin/sh wrapper and BASH_ENV can find it.
+	// The real filesystem boundary is the container mount landscape: the
+	// container runs from the minimal runtime image (no /home, /var, /root,
+	// /srv, /opt; unreadable /etc/passwd) and the project is the ONLY
+	// writable bind mount at /workspace. Nothing outside the project is
+	// reachable by absolute path, relative ".." walk or symlink, so the
+	// cd() override below is defense-in-depth for shell ergonomics: it uses
+	// physical path resolution (cd -P) and an exact /workspace|/workspace/*
+	// boundary test, so interior navigation ("cd src; cd ..; cd ../tests")
+	// works while any attempt to step above the project — cd .. at
+	// /workspace, cd /, cd ~, cd ../src — is refused and the shell is put
+	// back where it was.
 	const setupScript = `#!/bin/sh
 set -e
 
 # ---- workspace jail rcfile ----
 mkdir -p /tmp
 cat > /tmp/.aegis-jailrc << 'JAILRC'
-export HOME=/home/node
+export HOME=/agent/cache
+_aegis_deny() {
+  printf '\033[0;31m[aegis]\033[0m access denied: leaving the project (/workspace) is not allowed\n' >&2
+}
 cd() {
-  local target="${1:-.}"
-  builtin cd "$target" || return 1
+  local prev="$PWD" t
+  if [ "${1:-}" = "--" ]; then shift 2>/dev/null; fi
+  if [ $# -gt 1 ]; then
+    printf '%s\n' 'bash: cd: too many arguments' >&2
+    return 1
+  fi
+  t="${1:-.}"
+  if [ "$t" = "-" ]; then
+    t="${OLDPWD:-.}"
+  fi
+  builtin cd -P -- "$t" || return 1
   case "$PWD" in
-    /workspace*) ;;
-    *) printf '\033[0;31m[aegis]\033[0m access denied: leaving workspace is not allowed\n' >&2; builtin cd /workspace ;;
+    /workspace|/workspace/*) return 0 ;;
   esac
+  _aegis_deny
+  builtin cd -P -- "$prev" >/dev/null 2>&1 || builtin cd -P -- /workspace >/dev/null 2>&1
+  return 1
 }
 JAILRC
 chmod 644 /tmp/.aegis-jailrc

@@ -28,10 +28,14 @@ func mustRead(t *testing.T, path string) string {
 	return string(b)
 }
 
-func TestDetectRootFindsMarkerUpward(t *testing.T) {
+// TestDetectRootUsesLaunchDir pins the new boundary semantics: PROJECT_ROOT
+// is the launch directory itself, canonicalized to its real path. There is no
+// marker-based walk-up, so a nested launch dir stays the root even when a
+// parent contains a go.mod.
+func TestDetectRootUsesLaunchDir(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "go.mod"), "module x\n", 0o644)
-	nested := filepath.Join(root, "a", "b", "c")
+	nested := filepath.Join(root, "a", "b")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -39,8 +43,40 @@ func TestDetectRootFindsMarkerUpward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DetectRoot: %v", err)
 	}
+	if got != nested {
+		t.Fatalf("root = %s, want the launch dir itself %s", got, nested)
+	}
+
+	// Launching on the marker owner itself also keeps that exact directory.
+	got, err = DetectRoot(root)
+	if err != nil {
+		t.Fatalf("DetectRoot: %v", err)
+	}
 	if got != root {
 		t.Fatalf("root = %s, want %s", got, root)
+	}
+}
+
+// TestDetectRootCanonicalizesSymlinks confirms the boundary is resolved to
+// its real path: a project reached through a symlink is still anchored at
+// the physical directory that gets bind-mounted.
+func TestDetectRootCanonicalizesSymlinks(t *testing.T) {
+	real := t.TempDir()
+	write(t, filepath.Join(real, "app.txt"), "x", 0o644)
+	link, err := os.MkdirTemp(t.TempDir(), "link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(link)
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DetectRoot(link)
+	if err != nil {
+		t.Fatalf("DetectRoot: %v", err)
+	}
+	if got != real {
+		t.Fatalf("root = %s, want canonical real path %s", got, real)
 	}
 }
 
@@ -52,6 +88,73 @@ func TestDetectRootFallbackAndGuards(t *testing.T) {
 	}
 	if _, err := DetectRoot(plain + "/does-not-exist-xyz"); err == nil {
 		t.Fatal("nonexistent start should error")
+	}
+}
+
+func TestDetectRootRefusesHomeAndFilesystemRoot(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if _, err := DetectRoot(home); err == nil {
+			t.Fatal("home directory must not be accepted as project root")
+		}
+	}
+	if _, err := DetectRoot(string(filepath.Separator)); err == nil {
+		t.Fatal("filesystem root must not be accepted as project root")
+	}
+}
+
+// TestWithinBoundary exercises the component-wise boundary test used for
+// host-side path safety: the boundary itself and everything beneath it are
+// inside; parents, siblings, and visual-prefix lookalikes are outside.
+func TestWithinBoundary(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(root)
+
+	tests := []struct {
+		name      string
+		candidate string
+		want      bool
+	}{
+		{"boundary itself", root, true},
+		{"direct child", src, true},
+		{"nonexistent descendant", filepath.Join(src, "nope"), true},
+		{"sibling", root + "2", false},
+		{"parent", parent, false},
+		{"grandparent", filepath.Dir(parent), false},
+	}
+	for _, tc := range tests {
+		if got, err := WithinRoot(root, tc.candidate); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		} else if got != tc.want {
+			t.Errorf("%s: within(%q) = %v, want %v", tc.name, tc.candidate, got, tc.want)
+		}
+	}
+}
+
+// TestWithinBoundaryDetectsSymlinkEscapes: a candidate path that crosses the
+// boundary through a symlink is reported outside, mirroring the container
+// mount boundary where an interior link cannot reach host paths.
+func TestWithinBoundaryDetectsSymlinkEscapes(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret")
+	write(t, secret, "s", 0o600)
+	if err := os.Symlink(outside, filepath.Join(root, "backdoor")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := WithinRoot(root, filepath.Join(root, "backdoor", "secret")); err != nil {
+		t.Fatal(err)
+	} else if got {
+		t.Fatal("candidate escaping through a symlink reported inside the boundary")
+	}
+	if got, err := WithinRoot(root, filepath.Join(root, "backdoor")); err != nil {
+		t.Fatal(err)
+	} else if got {
+		t.Fatal("the link entry itself resolves to the outside dir and must be outside")
 	}
 }
 
@@ -201,40 +304,98 @@ func TestComputeDiffKinds(t *testing.T) {
 	}
 }
 
-func TestAgentEditsNeverTouchTrustedProject(t *testing.T) {
-	root := t.TempDir()
-	dest := t.TempDir()
-	write(t, filepath.Join(root, "app.py"), "print('v1')\n", 0o644)
-	write(t, filepath.Join(root, ".env"), "SECRET=host-only\n", 0o600)
+// TestDirectWorkspaceBaselineAndDiff pins the direct-mount contract: the
+// audit baseline is a manifest of the live project (BuildManifest, never a
+// copy), the agent edits the SAME project directory in place, and ComputeDiff
+// resolves that into the session change set. Excluded dirs (.aegis hooks,
+// .git, package caches) never enter the diff.
+func TestDirectWorkspaceBaselineAndDiff(t *testing.T) {
+	project := t.TempDir()
+	write(t, filepath.Join(project, "app.py"), "print('v1')\n", 0o644)
+	write(t, filepath.Join(project, ".env"), "SECRET=host-only\n", 0o600)
 
-	res, err := Snapshot(root, dest)
+	before, err := BuildManifest(project)
 	if err != nil {
 		t.Fatal(err)
 	}
-	trustedBefore, err := TreeDigest(root)
+
+	// "Agent" edits land directly in the project directory.
+	write(t, filepath.Join(project, "app.py"), "print('v2')\n", 0o644)
+	write(t, filepath.Join(project, "feature.py"), "print('new')\n", 0o644)
+	write(t, filepath.Join(project, ".aegis", "bin", "hook.sh"), "# hook", 0o700)
+	write(t, filepath.Join(project, "node_modules", "x.js"), "cache", 0o644)
+	os.Remove(filepath.Join(project, ".env"))
+
+	changes, current, err := ComputeDiff(before, project)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	write(t, filepath.Join(dest, "app.py"), "print('agent was here')\n", 0o644)
-	write(t, filepath.Join(dest, "feature.py"), "print('new')\n", 0o644)
-
-	trustedAfter, err := TreeDigest(root)
-	if err != nil {
-		t.Fatal(err)
+	got := map[string]Change{}
+	for _, ch := range changes {
+		got[ch.Path] = ch
 	}
-	if len(trustedBefore) != len(trustedAfter) {
-		t.Fatalf("trusted project file count changed: %d -> %d", len(trustedBefore), len(trustedAfter))
+	if got["app.py"].Kind != KindModified {
+		t.Errorf("app.py = %s, want modified", got["app.py"].Kind)
 	}
-	for p, h := range trustedBefore {
-		if trustedAfter[p] != h {
-			t.Fatalf("trusted file %s mutated by agent activity", p)
+	if got["feature.py"].Kind != KindAdded {
+		t.Errorf("feature.py = %s, want added", got["feature.py"].Kind)
+	}
+	if got[".env"].Kind != KindDeleted {
+		t.Errorf(".env = %s, want deleted", got[".env"].Kind)
+	}
+	for _, p := range []string{".aegis/bin/hook.sh", "node_modules/x.js"} {
+		if _, ok := got[p]; ok {
+			t.Errorf("excluded path %s must not enter the diff", p)
 		}
 	}
-	if mustRead(t, filepath.Join(root, "app.py")) != "print('v1')\n" {
-		t.Fatal("trusted app.py modified without apply step")
+	// The in-place contract: edits are already in the live project.
+	if mustRead(t, filepath.Join(project, "app.py")) != "print('v2')\n" {
+		t.Fatal("agent edit missing from live project")
 	}
-	_ = res
+	if _, ok := current["app.py"]; !ok {
+		t.Fatal("current manifest missing the edited file")
+	}
+}
+
+// TestValidatePromotionAllowsInPlaceChanges: in the direct model the "host"
+// and the "workspace" are the same directory, so promotion validation must
+// accept the agent's in-place edits while still refusing illegal paths and
+// symlinks that escape the project when followed from the host side.
+func TestValidatePromotionAllowsInPlaceChanges(t *testing.T) {
+	project := t.TempDir()
+	write(t, filepath.Join(project, "src/lib.go"), "v1", 0o644)
+	before, err := BuildManifest(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	write(t, filepath.Join(project, "src/lib.go"), "v2", 0o644)
+	write(t, filepath.Join(project, "src/new.go"), "brand-new", 0o755)
+	os.Remove(filepath.Join(project, "src/nonexistent.go"))
+	changes, _, err := ComputeDiff(before, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) == 0 {
+		t.Fatal("expected in-place changes")
+	}
+	if err := ValidatePromotion(project, before, changes); err != nil {
+		t.Fatalf("in-place changes must validate: %v", err)
+	}
+
+	// An escaping symlink added by the agent is refused at promotion time.
+	outside := filepath.Join(t.TempDir(), "pwned.txt")
+	write(t, outside, "s", 0o600)
+	link := []Change{{
+		Path: "innocent.txt",
+		Kind: KindAdded,
+		New:  &Entry{Type: "symlink", Target: outside},
+	}}
+	err = ValidatePromotion(project, before, link)
+	var uce *UnsafeChangeError
+	if !errors.As(err, &uce) {
+		t.Fatalf("escaping symlink not refused: %T %v", err, err)
+	}
 }
 
 func fullPromotionFlow(t *testing.T) (sessionDir, root, dest string, changes []Change) {

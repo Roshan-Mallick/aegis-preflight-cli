@@ -4,7 +4,7 @@
 
 **Original Author & Owner:** [Roshan Mallick](https://github.com/Roshan-Mallick) · Copyright (c) 2026 Roshan Mallick
 
-AEGIS is a security runtime and control plane for AI coding agents. It treats the agent as **untrusted by design**: the agent can only write to an isolated copy of the project, its network egress is controlled, all of its observations are recorded, and changes reach the trusted codebase only after PreFlight security validation passes.
+AEGIS is a security runtime and control plane for AI coding agents. It treats the agent as **untrusted by design**: the agent can only work inside the directory it was launched from — mounted directly into a hardened sandbox as `/workspace` — its network egress is controlled, all of its observations are recorded, and every change it makes is baselined and security-validated before the session is released.
 
 ## What problem it solves
 
@@ -12,10 +12,10 @@ AI coding agents operate with broad, unchecked authority: they can read any file
 
 AEGIS places an enforcement boundary around the agent so that it is **never its own security authority**:
 
-- The agent runs in an isolated sandbox with no direct access to the host filesystem.
+- The agent runs in a hardened Docker sandbox. The launch directory (the security boundary) is bind-mounted at `/workspace`; everything outside it — home, siblings, the host filesystem — is invisible and unreachable, and the container root is read-only.
 - Network egress is allowlisted at the network layer (DNS + HTTP/CONNECT proxy).
 - Every tool call, file access, and command is observed and recorded.
-- Changes never reach the trusted project until PreFlight validation passes.
+- Edits land directly in the project via the mount, but each session is baselined at start and the change set is security-scanned before the session is released (`aegis apply` validates and records).
 
 ## Architecture
 
@@ -49,7 +49,7 @@ The control plane runs fully **offline** — it makes no external calls of its o
 
 ## Key features
 
-- **Agent-contained sandbox** — hardened Docker isolation (`--cap-drop ALL`, `no-new-privileges`, non-root user, read-only root, tmpfs overlays for `/root`, `/home`, `/var`, `/boot`).
+- **Agent-contained sandbox** — hardened Docker isolation (`--cap-drop ALL`, `no-new-privileges`, non-root user, read-only root, private `/tmp`/`/run` tmpfs) running on a **minimal runtime image** derived from the tool image: `/home`, `/root`, `/var`, `/srv`, `/opt`, `/boot`, `/media`, `/mnt` are deleted from the filesystem itself and `/etc/passwd`/`/etc/group` are root-owned `0600`, so the agent cannot reach them by absolute path, relative `..` walk, or symlink — the boundary is enforced by the mount/filesystem layer, not by shell policy.
 - **Egress control** — DNS allowlist + HTTP/CONNECT proxy allowlist; raw-IP and private/loopback destinations are blocked by policy.
 - **Deterministic observation** — hooks injected into the workspace capture every tool call before it executes, normalized into a canonical event stream.
 - **Event store** — authoritative, append-only JSONL events (mode `0600`) that live outside the agent's reach.
@@ -73,24 +73,24 @@ The **control plane itself is always offline** — it never phones home. Its dec
 ## How the security / remediation workflow works
 
 ```
-ENTRY → SNAPSHOT → SANDBOX → AGENT (ACTIVE) → AGENT_FINISHED → SECURITY_SCAN
-                                                                     │
-                                             ┌─────────┐  ┌──────────┴──────────┐
-                                             │  PASS   │  │       BLOCK         │
-                                             └────┬────┘  └──────────┬──────────┘
-                                                  │                   │
-                                          RELEASE_READY           WRITE FIX REQUEST
-                                                  │                   │
-                                              apply to          agent relaunches
-                                             trusted project       & rescans
-                                                                   (≤ 3 cycles)
+ENTRY → PROJECT BASELINE → SANDBOX → AGENT (ACTIVE) → AGENT_FINISHED → SECURITY_SCAN
+                                                                      │
+                                              ┌─────────┐  ┌──────────┴──────────┐
+                                              │  PASS   │  │       BLOCK         │
+                                              └────┬────┘  └──────────┬──────────┘
+                                                   │                   │
+                                          VERIFIED + RECORDED       WRITE FIX REQUEST
+                                                   │                   │
+                                             aegis apply          agent relaunches
+                                          (validate & record)        & rescans
+                                                                    (≤ 3 cycles)
 ```
 
-1. A session is created and the trusted project is snapshotted into an isolated workspace.
-2. The agent launches inside the sandbox under simultaneous file / tool / network monitoring.
-3. When the agent finishes, its workspace is security-scanned (secrets via gitleaks, vulnerable dependencies via `npm-audit` / `pip-audit`).
-4. If findings are non-blocking, the session passes and changes can be promoted with `aegis apply`.
-5. If blocking findings exist, a fix request is written and the agent may re-run (same session) to remediate; it is rescanned. This BLOCK → FIX → relaunch → PASS cycle runs at most 3 times.
+1. A session is created and the launch directory is baselined with an audit manifest (no copy is made anywhere).
+2. The agent launches inside the sandbox — the launch directory mounted as `/workspace` — under simultaneous file / tool / network monitoring.
+3. When the agent finishes, the live project is security-scanned in place (secrets via gitleaks, vulnerable dependencies via `npm-audit` / `pip-audit`).
+4. If findings are non-blocking, the session passes and its change set can be validated and recorded with `aegis apply`.
+5. If blocking findings exist, a fix request is written and the agent may re-run (same session, same project) to remediate; it is rescanned. This BLOCK → FIX → relaunch → PASS cycle runs at most 3 times.
 6. Every meaningful event is recorded to the session's authoritative event store for audit.
 
 ## Installation / build
@@ -198,7 +198,7 @@ internal/response/      Incident response + evidence bundles
 internal/sandbox/       Docker container management + isolation verification
 internal/session/       Session state machine + manager
 internal/tui/           Bubbletea split TUI (PTY, feed, status bar)
-internal/workspace/     Snapshot + diff + apply + manifest
+internal/workspace/     Boundary (PROJECT_ROOT), manifest baseline + in-place diff/apply
 scripts/install.sh      Installer
 docs/                   Threat model and event-schema documentation
 ```

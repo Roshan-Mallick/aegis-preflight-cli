@@ -8,8 +8,17 @@ import (
 )
 
 const (
+	// AgentImage is the tooling source image: bash, node, python, git plus
+	// the AEGIS /bin/sh workspace-jail wrapper. The runtime image is derived
+	// from it by pruning it down to a strictly minimal, non-sensitive root
+	// filesystem (see sandbox.EnsureRuntimeImage).
 	AgentImage = "aegis-agent:v1"
-	ProxyImage = "aegis-proxy:v1"
+	// RuntimeImage is the minimal hardened root filesystem the sandbox
+	// actually runs from. It contains only what the agent's own processes
+	// need to execute; /home, /var, /root, /srv, /opt and host-derived
+	// configuration are absent, and /etc/passwd//etc/group are unreadable.
+	RuntimeImage = "aegis-runtime:v1"
+	ProxyImage   = "aegis-proxy:v1"
 )
 
 //go:embed docker/agent.Dockerfile

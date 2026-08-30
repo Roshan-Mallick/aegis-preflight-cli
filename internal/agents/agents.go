@@ -18,12 +18,13 @@ type Agent struct {
 var registry = map[string]func() *Agent{
 	"opencode": detectOpencode,
 	"claude":   detectClaude,
+	"codex":    detectCodex,
 }
 
 func Detect(name string) (*Agent, error) {
 	fn, ok := registry[name]
 	if !ok {
-		return nil, fmt.Errorf("unknown agent %q (supported: opencode, claude)", name)
+		return nil, fmt.Errorf("unknown agent %q (supported: opencode, claude, codex)", name)
 	}
 	a := fn()
 	if a == nil {
@@ -97,6 +98,37 @@ func detectClaude() *Agent {
 			BinaryPath:  abs,
 			ConfigDir:   filepath.Join(home, ".claude"),
 			Description: "Claude Code agent",
+		}
+	}
+	return nil
+}
+
+func detectCodex() *Agent {
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, ".codex", "bin", "codex"),
+		"/usr/local/bin/codex",
+		"/usr/bin/codex",
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && info.Mode()&0111 != 0 {
+			return &Agent{
+				Name:        "codex",
+				BinaryPath:  p,
+				ConfigDir:   filepath.Join(home, ".codex"),
+				DataDir:     filepath.Join(home, ".codex"),
+				Description: "OpenAI Codex CLI agent",
+			}
+		}
+	}
+	if path, err := exec.LookPath("codex"); err == nil {
+		abs, _ := filepath.Abs(path)
+		return &Agent{
+			Name:        "codex",
+			BinaryPath:  abs,
+			ConfigDir:   filepath.Join(home, ".codex"),
+			DataDir:     filepath.Join(home, ".codex"),
+			Description: "OpenAI Codex CLI agent",
 		}
 	}
 	return nil
