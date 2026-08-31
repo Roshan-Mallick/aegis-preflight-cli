@@ -27,9 +27,7 @@ Deterministic Security Checks
 
 ## Demo
 
-<p align="center">
-  <img src="assets/working.gif" alt="AEGIS working demo" width="900">
-</p>
+[▶ View / download the working demo](assets/working.mp4)
 
 The demo walks through a real session: the agent works on a project inside the sandbox, AEGIS observes its file/tool/network activity, the deterministic preflight scan and the Local AI Exit Gate run at the end, and the session is either released or routed back into the remediation loop.
 
@@ -180,7 +178,7 @@ internal/tui/           Bubbletea split TUI (PTY, feed, status bar)
 internal/workspace/     PROJECT_ROOT boundary, manifest baseline + in-place diff/apply
 scripts/install.sh      Installer
 docs/                   Threat model and event-schema documentation
-assets/                 Working demo GIF (assets/working.gif)
+assets/                 Working demo video (assets/working.mp4)
 ```
 
 ---

@@ -5,8 +5,8 @@ build.md
 
 # --- Stale top-level assets (embedded copies live under internal/) ---
 /assets/*
-# ...but the working demo GIF is intentionally tracked for the README.
-!/assets/working.gif
+# ...but the working demo video is intentionally tracked for the README.
+!/assets/working.mp4
 
 # --- Build outputs / binaries ---
 /aegis
