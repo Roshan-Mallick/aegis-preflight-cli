@@ -5,12 +5,6 @@
 
 AEGIS is an execution‑time security enforcement layer that sits between an AI coding agent and the project it works on. It treats the agent as **untrusted by design**, contains it inside a hardened sandbox, controls its network egress, records everything it does, and — before the agent is allowed to finish a task — runs deterministic security checks plus an optional **Local AI Exit Gate** that performs a final security review.
 
-<p align="center">
-  <video src="assets/working.mp4" controls loop muted alt="AEGIS working demo" width="90%"></video>
-  <br/>
-  <em>Working demo — an agent session contained by the AEGIS sandbox, network control, deterministic preflight scan, and Local AI Exit Gate.</em>
-</p>
-
 ## What is AEGIS?
 
 AEGIS is not a model and not a linter that runs once. It is a **control plane placed around the agent** so that the agent is never its own security authority:
@@ -222,9 +216,9 @@ aegis run opencode
 
 ## Demo
 
-The working demo is embedded at the top of this README:
+### Working demo
 
-- [Working demo video](assets/working.mp4)
+[▶ View / download the working demo](assets/working.mp4)
 
 The demo walks through a real session: the agent works on a project inside the sandbox, AEGIS observes its file/tool/network activity, the deterministic preflight scan and the Local AI Exit Gate run at the end, and the session is either released or routed back into the remediation loop.
 
