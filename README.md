@@ -1,217 +1,259 @@
-# AEGIS — Zero-Trust Security Runtime for AI Coding Agents
+# AEGIS — a security enforcement layer for AI coding agents
 
 **Repository:** `aegis-preflight-cli`
+**Maintainer:** [Roshan Mallick](https://github.com/Roshan-Mallick) · Copyright (c) 2026 Roshan Mallick
 
-**Original Author & Owner:** [Roshan Mallick](https://github.com/Roshan-Mallick) · Copyright (c) 2026 Roshan Mallick
+AEGIS is an execution‑time security enforcement layer that sits between an AI coding agent and the project it works on. It treats the agent as **untrusted by design**, contains it inside a hardened sandbox, controls its network egress, records everything it does, and — before the agent is allowed to finish a task — runs deterministic security checks plus an optional **Local AI Exit Gate** that performs a final security review.
 
-AEGIS is a security runtime and control plane for AI coding agents. It treats the agent as **untrusted by design**: the agent can only work inside the directory it was launched from — mounted directly into a hardened sandbox as `/workspace` — its network egress is controlled, all of its observations are recorded, and every change it makes is baselined and security-validated before the session is released.
+<p align="center">
+  <video src="assets/working.mp4" controls loop muted alt="AEGIS working demo" width="90%"></video>
+  <br/>
+  <em>Working demo — an agent session contained by the AEGIS sandbox, network control, deterministic preflight scan, and Local AI Exit Gate.</em>
+</p>
 
-## What problem it solves
+## What is AEGIS?
 
-AI coding agents operate with broad, unchecked authority: they can read any file, write anywhere, run arbitrary shell commands, and reach out to the network. When an agent is given direct access to a trusted repository, a single mistake or a maliciously prompted action can leak secrets, corrupt the codebase, or exfiltrate data before anyone notices.
-
-AEGIS places an enforcement boundary around the agent so that it is **never its own security authority**:
-
-- The agent runs in a hardened Docker sandbox. The launch directory (the security boundary) is bind-mounted at `/workspace`; everything outside it — home, siblings, the host filesystem — is invisible and unreachable, and the container root is read-only.
-- Network egress is allowlisted at the network layer (DNS + HTTP/CONNECT proxy).
-- Every tool call, file access, and command is observed and recorded.
-- Edits land directly in the project via the mount, but each session is baselined at start and the change set is security-scanned before the session is released (`aegis apply` validates and records).
-
-## Architecture
+AEGIS is not a model and not a linter that runs once. It is a **control plane placed around the agent** so that the agent is never its own security authority:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                       Trusted Project                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │             AEGIS Control Plane                      │   │
-│  │  ┌───────────┐ ┌───────────┐ ┌───────────────────┐  │   │
-│  │  │  Session   │ │ Snapshot  │ │  Event Store      │  │   │
-│  │  │  Manager   │ │ & Diff    │ │  (JSONL, 0600)    │  │   │
-│  │  └───────────┘ └───────────┘ └───────────────────┘  │   │
-│  │  ┌───────────┐ ┌───────────┐ ┌───────────────────┐  │   │
-│  │  │ PreFlight  │ │  Network  │ │   Correlation     │  │   │
-│  │  │  Scanner   │ │  Gateway  │ │   Engine          │  │   │
-│  │  └───────────┘ └───────────┘ └───────────────────┘  │   │
-│  │  ┌───────────┐ ┌───────────┐ ┌───────────────────┐  │   │
-│  │  │  Response  │ │   TUI     │ │  Evidence Bundle  │  │   │
-│  │  │  Engine    │ │ (live)    │ │  (committed)      │  │   │
-│  │  └───────────┘ └───────────┘ └───────────────────┘  │   │
-│  └───────────────────┬─────────────────────────────────┘   │
-│                      │  write (verified diff only)          │
-│                 ┌────▼─────┐                                │
-│                 │  Sandbox  │ ← network gateway (DNS+proxy) │
-│                 │ (Docker)  │ ← observation hooks           │
-│                 └──────────┘                                │
-└────────────────────────────────────────────────────────────┘
+Cloud AI Agent
+      |
+      v
+     AEGIS
+      |
+      v
+Sandboxed Project
+      |
+      v
+Deterministic Security Checks
+      |
+      v
+Local AI Exit Gate
+  PASS / BLOCK
+      |
+      v
+Safe Exit or Remediation
 ```
 
-The control plane runs fully **offline** — it makes no external calls of its own. All network decisions, session state, and scanning logic execute locally. The only network traffic in a session is the agent's own, and it is constrained by the allowlist.
+The agent works on a project that is bind‑mounted into a hardened Docker sandbox as `/workspace`. Everything outside that launch directory — the rest of your home directory, sibling projects, the host filesystem — is deliberately absent from the container's filesystem. Network egress is allowlisted at the DNS and HTTP/CONNECT proxy layers. Every tool call, file access, and command is observed and recorded into an append‑only event store.
 
-## Key features
+When the agent reports that it is finished, AEGIS does **not** immediately let it exit. The change set is baselined and security‑scanned, and — if enabled — a local AI advisor reviews compact evidence of the whole task before the session may reach a `PASS` state.
 
-- **Agent-contained sandbox** — hardened Docker isolation (`--cap-drop ALL`, `no-new-privileges`, non-root user, read-only root, private `/tmp`/`/run` tmpfs) running on a **minimal runtime image** derived from the tool image: `/home`, `/root`, `/var`, `/srv`, `/opt`, `/boot`, `/media`, `/mnt` are deleted from the filesystem itself and `/etc/passwd`/`/etc/group` are root-owned `0600`, so the agent cannot reach them by absolute path, relative `..` walk, or symlink — the boundary is enforced by the mount/filesystem layer, not by shell policy.
-- **Egress control** — DNS allowlist + HTTP/CONNECT proxy allowlist; raw-IP and private/loopback destinations are blocked by policy.
-- **Deterministic observation** — hooks injected into the workspace capture every tool call before it executes, normalized into a canonical event stream.
-- **Event store** — authoritative, append-only JSONL events (mode `0600`) that live outside the agent's reach.
-- **PreFlight enforcement** — gates every promotion to the trusted project behind a security scan with a BLOCK → FIX → relaunch → PASS cycle.
-- **Remediation loop** — same-session remediation: blocked agents are told what to fix, can relaunch bounded by the same sandbox, and are rescanned.
-- **Correlation engine** — detects patterns (e.g., sensitive file access followed by a blocked egress attempt) within a time window.
-- **Real-time TUI** — a split-pane terminal with the live agent PTY on one side and the AEGIS security feed on the other, plus a stable status bar.
-- **Evidence preservation** — the container is snapshotted before any destructive action so evidence survives an agent kill.
+## Why AEGIS?
 
-## Offline vs. network-aware mode
+AI coding agents have broad authority: they read and write files, execute arbitrary shell commands, invoke tools, and reach out to the network. Given direct access to a trusted repository, a single mistake or a maliciously prompted action can:
 
-AEGIS has two network operating modes:
+- read and leak secrets or sensitive files,
+- modify or corrupt the codebase,
+- reach external services the developer never approved,
+- install dependencies that carry known vulnerabilities, or
+- leave behind code with injection, auth‑bypass, or other security flaws.
 
-| Mode | Flag | Behavior |
-|------|------|----------|
-| **strict (default)** | `--net strict` | Only `api.anthropic.com` is reachable. Everything else, including raw IPs and private ranges, is blocked. Suitable for the highest-assurance workloads. |
-| **dev** | `--net dev` | Adds common development hosts to the allowlist (`registry.npmjs.org`, `pypi.org`, `proxy.golang.org`, `github.com`, `opencode.ai`, etc.). Enables dependency fetching and toolchains inside the sandbox. |
+AEGIS contains that authority and adds a **final security review** so that release, promotion, or "task complete" is a deliberate, inspection‑gated decision rather than the agent's word.
 
-The **control plane itself is always offline** — it never phones home. Its decisions are computed locally. The optional **local AI exit review** is a self-hosted LLM served from `127.0.0.1`; when enabled it acts as a final security reviewer at the exit gate (see below). It is disabled by default.
+## Core Security Architecture
 
-## How the security / remediation workflow works
+The components below are implemented in `internal/` and orchestrated by `internal/pipeline/`:
+
+- **Project boundary + deterministic preflight** — the launch directory is baselined into an audit manifest at session start (`internal/workspace`). On exit, the live change set is scanned in place by deterministic scanners (`gitleaks` for secrets, `npm-audit` / `pip-audit` for vulnerable dependencies) and gated behind a BLOCK → FIX → relaunch → PASS loop (`internal/preflight`).
+- **Sandbox enforcement** — a hardened Docker container (`--cap-drop ALL`, `no-new-privileges`, non‑root user `1000:1000`, `--read-only` root, private tmpfs for `/tmp`, `/run`, and the agent scratch space `/agent/cache`) running on a **minimal pruned runtime image** where `/home`, `/root`, `/var`, `/srv`, `/opt`, `/media`, `/mnt`, `/boot` are deleted from the filesystem itself and `/etc/passwd`/`/etc/group` are root‑owned and unreadable (`internal/sandbox`).
+- **Network / API monitoring & enforcement** — a DNS + HTTP/CONNECT proxy sidecar (`cmd/aegis-proxy`) with domain allowlists per profile. `strict` permits only `api.anthropic.com`; `dev` also allows common package registries and git hosts. Raw IPs, private/loopback ranges, and non‑allowlisted ports are blocked by policy (`internal/network`, `internal/egress`).
+- **Secret detection & redaction** — secrets are detected deterministically (gitleaks) and, wherever a value must travel toward the local AI advisor or the terminal, `Redact` masks recognizable secret shapes before they can reach a prompt (`internal/egress`, `internal/exitgate/redact.go`).
+- **Compact security evidence** — the local advisor receives a small structured summary (paths, hashes, counts, command names, observed destinations, findings, tiny redacted snippets) capped at 16 KB, never the conversation or full file contents (`internal/exitgate/evidence.go`).
+- **Local AI Exit Gate** — an optional final security review run against a self‑hosted OpenAI‑compatible model endpoint (`internal/exitgate`, `internal/model`).
+- **Deterministic BLOCK overriding AI PASS** — the Local AI is advisory only. If the deterministic check blocks, the AI review is skipped entirely and the deterministic block is final.
+- **AI BLOCK → remediation → re‑review** — an AI block writes a concise `.aegis/FIX_REQUEST.md` into the workspace and the agent is relaunched in the same session to fix and resubmit; the exit gate re‑reviews.
+- **Fail‑closed on unavailable advisor** — if the advisor cannot be reached or its answer cannot be parsed, the session blocks by default (or passes with an explicit "advisory skipped" warning under an opt‑in `warn` policy). An unavailable advisor is never treated as an approval.
+- **AEGIS_REPO_ROOT** — lets a globally installed `aegis` binary locate the source repository (which contains `cmd/aegis-proxy`) so the egress proxy sidecar can be (re)built when it is run from a directory other than the repo.
+
+## Local AI Exit Gate
+
+The cloud AI agent works on the project normally. When it reports that the task is finished, AEGIS does **not** immediately allow it to exit:
 
 ```
-ENTRY → PROJECT BASELINE → SANDBOX → AGENT (ACTIVE) → AGENT_FINISHED → SECURITY_SCAN
-                                                                      │
-                                              ┌─────────┐  ┌──────────┴──────────┐
-                                              │  PASS   │  │       BLOCK         │
-                                              └────┬────┘  └──────────┬──────────┘
-                                                   │                   │
-                                          VERIFIED + RECORDED       WRITE FIX REQUEST
-                                                   │                   │
-                                             aegis apply          agent relaunches
-                                          (validate & record)        & rescans
-                                                                    (≤ 3 cycles)
+agent "I'm finished"
+         |
+         v
+   AEGIS EXIT GATE
+         |
+         v
+   LOCAL AI ADVISOR
+   reviews compact evidence:
+     • What changed?
+     • Were security-sensitive files accessed?
+     • Were APIs/network resources accessed?
+     • Were secrets encountered?
+     • Were unsafe changes introduced?
+     • Are there security concerns?
+         |
+     PASS / BLOCK
+         |
+    allow exit  OR  remediation loop
 ```
 
-1. A session is created and the launch directory is baselined with an audit manifest (no copy is made anywhere).
-2. The agent launches inside the sandbox — the launch directory mounted as `/workspace` — under simultaneous file / tool / network monitoring.
-3. When the agent finishes, the live project is security-scanned in place (secrets via gitleaks, vulnerable dependencies via `npm-audit` / `pip-audit`).
-4. If findings are non-blocking, the session passes and its change set can be validated and recorded with `aegis apply`.
-5. If blocking findings exist, a fix request is written and the agent may re-run (same session, same project) to remediate; it is rescanned. This BLOCK → FIX → relaunch → PASS cycle runs at most 3 times.
-6. Every meaningful event is recorded to the session's authoritative event store for audit.
+The advisor returns a strict JSON verdict — `{"decision":"PASS"|"BLOCK","risk":"NONE"|...|"CRITICAL","summary":...,"findings":[...]}`.
 
-## Local AI exit review (optional)
+**Important invariant:** the Local AI advisor is **advisory only**. A deterministic AEGIS BLOCK can **never** be overridden by an AI PASS. When the advisor blocks, AEGIS writes the remediation request (`.aegis/FIX_REQUEST.md`), keeps the agent in the workflow, and performs another review after remediation. If the advisor is unavailable, the system fails closed according to the configured policy (`block` by default, `warn` opt‑in).
 
-An optional self-hosted LLM (`model.New` + the existing OpenAI-compatible chat endpoint) performs a **final exit security review** after the deterministic scan passes — before a session may change state to `PASS`. Key properties:
+## Security Evidence
 
-- **Token-budget evidence, not conversation history.** The reviewer receives a compact summary: paths of changed files, command/program hashes, network destinations that were attempted, sensitive-file accesses, scanner findings, and redacted snippets (only when a scanner finding or sensitive access points at a file). Secrets and exact file contents are never sent (`Redact` masks `sk-/pk-/ak-/rk-`, AWS keys, GitHub tokens, slack/webhook tokens, generic `key=value` assignments, PEM blocks, Bearer headers, `user:pass` URLs). If nothing external was observed the prompt literally states `"External access: none"` / `"Screen/UI access: none observed"` — silence is never implied.
-- **Strict JSON verdict.** The reviewer must answer a fixed set of questions (did the agent launch other tools, access sensitive files, attempt external destinations, expose secrets, maintain the security boundary) and return `{"decision":"PASS"|"BLOCK","risk":"NONE"|"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","summary":...,"findings":[...]}`. Prose-wrapped JSON is tolerated; anything unparseable is treated as an error.
-- **Caching.** Reviews are cached by a digest of the evidence (`review_id` = sha256 of the evidence JSON). If remediation produces no material workspace change, the next cycle reuses the cached review — unchanged evidence is never re-sent to the model.
-- **Safe failure.** If `exit_gate.on_unavailable` is `"block"` (default, fail-closed) an unavailable/unparseable reviewer **blocks** the session. With `"warn"` it passes but the session is explicitly flagged "advisory skipped". A `BLOCK` never approves.
-- **Deterministic override.** An exit review **cannot** override a deterministic block — deterministic blocks are final and skip the review entirely to save tokens. On an AI `BLOCK` the agent is handed a concise `.aegis/FIX_REQUEST.md` and may relaunch in the same sandbox/session for remediation; the improved evidence is then re-reviewed.
+The Local AI does **not** receive the agent conversation, source files, raw command output, or secrets. It receives compact security evidence generated by AEGIS (`internal/exitgate`), containing only what is needed for the review:
 
-Enable it in `aegis.json` (checked when a session starts), or `AEGIS_EXIT_GATE=1`:
+- task/request summary and network profile,
+- changed‑file paths with size and a hash prefix (summarized by change counts; capped),
+- executed command names (capped),
+- security‑sensitive file accesses (paths only),
+- observed network destinations with the proxy decision (permitted vs. blocked),
+- scanner findings (severity, rule, file, line, message),
+- correlated incident summaries,
+- tiny redacted code snippets, only when a finding or sensitive access points at a file.
 
-```json
-{
-  "exit_gate": {
-    "enabled": true,
-    "on_unavailable": "block",
-    "base_url": "http://127.0.0.1:1234/v1",
-    "model": "aegis-review"
-  }
-}
-```
+Evidence is redacted for secrets and capped to a fixed byte budget. Reviews are cached by a digest of the evidence so unchanged material between remediation retries is **never re‑sent** to the model.
 
-The bridge connects using the session's project `aegis.json` (falls back to `~/.config/aegis/aegis.json`), and `base_url`/`model` fall back to any top-level `model`/`base_url` values. Disabled by default, so deterministic-only enforcement is unchanged.
+## Quickstart / Fresh User Setup
 
-## Installation / build
+### Prerequisites
 
-**Requirements:** Linux (first-class support), Go 1.27+, Docker, and `gitleaks` (host-side).
+- **Linux amd64** — required (the installer and the sandbox target Linux x86‑64; macOS/Windows are not supported).
+- **Docker Engine** with the **daemon running** and your user able to talk to it (see the `docker` group note below).
+- **Go 1.27+** — to build from source.
+- **opencode** (for `aegis run opencode`) — the CLI agent launched inside the sandbox. Claude Code and Codex are detected too.
+- **gitleaks** *(optional but recommended)* — host‑side secret scanner; the PreFlight gate reports `scanner-unavailable` (and blocks) if it is missing.
+- **First‑run internet access** — `aegis init` builds the sandbox Docker images, and the first build may download base layers.
 
-### From source
+### Clone, build, initialize
 
 ```bash
 git clone https://github.com/Roshan-Mallick/aegis-preflight-cli
 cd aegis-preflight-cli
+
+# Build the CLI
 go build -o aegis ./cmd/aegis
+
+# Build sandbox images and verify dependencies (first run may download layers)
+./aegis init
+
+# Verify your environment (Docker daemon, images, gitleaks)
+./aegis doctor
+
+# Launch opencode inside the hardened sandbox (strict network)
+./aegis run opencode
 ```
 
-### One-line installer
+### Docker permission (`docker` group)
+
+A simple mistake here produces a confusing `permission denied` on the first run. Your user must be able to reach the Docker daemon:
+
+```bash
+sudo usermod -aG docker "$USER"
+# log out and back in (or run 'newgrp docker') so the new group applies
+```
+
+> Note: The group membership only applies on a fresh login shell. If you just added yourself to `docker`, `docker ps` returning `permission denied` means the new group hasn't loaded — log out and back in, or run `newgrp docker`.
+
+### Project directory ownership (UID 1000)
+
+The sandbox runs as user `1000:1000` and the runtime image chowns `/workspace` to UID 1000. For the agent to read and write the mounted project, the launch directory must be owned by (or at least readable/writable by) UID 1000. If the agent cannot write files, check the project directory owner:
+
+```bash
+sudo chown -R 1000:1000 /path/to/your/project
+```
+
+### Credential persistence behavior
+
+Agent credentials and tool caches are **not** read from your host. Inside the sandbox, `HOME` and `TMPDIR` point at `/agent/cache` — a private, ephemeral tmpfs created per container. Agent runtime state (e.g. `.local`, `.config`, opencode/Claude caches) lives there and is discarded when the container is killed. The only things AEGIS writes into your project are the observation hook files under `.aegis/` and hook settings (an existing `.claude/settings.json` or `.opencode/plugins/aegis.js` is backed up as `*.aegis-backup`).
+
+### Common setup failures and exact fixes
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `permission denied` talking to Docker | user not in the `docker` group, or group not loaded in this shell | `sudo usermod -aG docker "$USER"` then re‑login / `newgrp docker`; `docker ps` to verify |
+| `gitleaks not found` in `doctor` | gitleaks missing | install gitleaks or `go install github.com/gitleaks/gitleaks/v8@latest` |
+| agent cannot write files in the sandbox | project dir not readable/writable by UID 1000 | `sudo chown -R 1000:1000 <project>` |
+| `aegis init` "first run may download base layers" | image layers not yet cached locally | ensure internet is available the first time; after that images are cached |
+
+## Usage
+
+### Normal clone-based workflow
+
+```bash
+# Build + initialize once
+go build -o aegis ./cmd/aegis
+./aegis init
+./aegis doctor
+
+# Launch opencode in the sandbox (strict network by default)
+./aegis run opencode
+
+# Launch with dev network access (package registries, git, opencode.ai)
+./aegis run --net dev opencode
+
+# Open an interactive sandbox shell (split TUI)
+./aegis run
+
+# Run a one-shot command
+./aegis run "ls -la"
+
+# Inspect session state / list sessions / follow live events
+./aegis status
+./aegis sessions
+./aegis report --follow <session-id>
+
+# Post-exit: validate and record a verified session
+./aegis preflight <session-id>
+./aegis apply <session-id>
+```
+
+### Installed / global binary workflow
+
+Install via the one‑line installer (downloads a release binary, falls back to a source build; requires Go for the source fallback):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Roshan-Mallick/aegis-preflight-cli/main/scripts/install.sh | bash
 ```
 
-The installer downloads a release binary (falls back to a source build), installs it into `~/bin`, and optionally builds the sandbox Docker images. Adjust `REPO` and the download URL in `scripts/install.sh` to match your fork before publishing a release.
-
-## How to run
+It installs `aegis` into `~/bin` (override with `AEGIS_INSTALL_DIR`). When running an installed binary from a directory **outside** the source repository, point `AEGIS_REPO_ROOT` at the cloned repo so the egress proxy sidecar can be built:
 
 ```bash
-# Build the sandbox image and initialize environment checks
+export AEGIS_REPO_ROOT="$HOME/aegis-preflight-cli"
 aegis init
-
-# Verify your environment (Docker, gitleaks, sandbox image)
-aegis doctor
-
-# Launch an interactive sandbox shell (split TUI)
-aegis run
-
-# Launch opencode in the sandbox (strict network)
 aegis run opencode
-
-# Launch opencode with dev network access
-aegis run --net dev opencode
-
-# Run a one-shot command in the sandbox
-aegis run "ls -la"
-
-# Inspect session state
-aegis status
-
-# See live session events
-aegis report --follow <session-id>
 ```
 
-## Example commands
+## Demo
 
-```bash
-# Full lifecycle: sandbox → agent → preflight → promote
-aegis run --net dev opencode "add a feature"
-aegis preflight <session-id>
-aegis apply <session-id>
-```
+The working demo is embedded at the top of this README:
 
-## How to run tests
+- [Working demo video](assets/working.mp4)
 
-```bash
-# Build everything
-go build ./...
+The demo walks through a real session: the agent works on a project inside the sandbox, AEGIS observes its file/tool/network activity, the deterministic preflight scan and the Local AI Exit Gate run at the end, and the session is either released or routed back into the remediation loop.
 
-# Run all unit tests with race detection
-go test -count=1 -race ./...
+## Security Model
 
-# Run a single package
-go test -count=1 -race ./internal/preflight/...
+AEGIS layers two distinct kinds of control:
 
-# Run live integration tests (requires Docker + gitleaks)
-go test -count=1 -v -run Integration ./internal/preflight/...
-go test -count=1 -v -run Integration ./internal/response/...
+- **Deterministic enforcement** — the hard, reliable boundary: sandbox isolation, network allowlisting, secret scanning, the PreFlight BLOCK gate. These never depend on a model and can never be overridden.
+- **Local AI reasoning** — an optional *advisory* final review that reasons over compact evidence to catch issues a signature scanner might not. It can add a BLOCK, but it **cannot** grant a pass that deterministic checks refuse.
+- **Sandbox / proxy controls** — the mechanical containment the AI cannot bypass: the pruned runtime filesystem, `--cap-drop ALL`, non‑root user, read‑only root, and DNS + HTTP/CONNECT egress control.
+- **Fail‑closed behavior** — when an advisory review cannot run, it is never treated as approval; the session blocks (or passes with an explicit "advisory skipped" warning only under the opt‑in `warn` policy).
 
-# Run end-to-end tests
-go test -count=1 -v -run EndToEnd ./internal/e2e/...
-```
+The Local AI **does not replace** deterministic security controls. Both are useful, but only the deterministic sandbox grants access, and only deterministic checks can permit a final exit.
 
-Some tests (those named `*_live_test.go`) talk to Docker and a live sandbox and will be skipped when Docker is unavailable. Task runner `aegis e2e`/pipeline tests run without a live daemon.
-
-## Project structure
+## Project Structure
 
 ```
-cmd/aegis/              CLI entry points (run, init, doctor, report, apply, status, ...)
-cmd/aegis-proxy/        Network egress proxy + DNS sidecar binary
-internal/agent/         Detected agent metadata
-internal/agents/        Agent auto-detection helpers
-internal/config/        Configuration loading
+cmd/aegis/              CLI entry points (run, init, doctor, report, apply, preflight, status, ...)
+cmd/aegis-proxy/        Network egress proxy + DNS sidecar
+internal/agent/         Agent process interaction metadata
+internal/agents/        Agent detection metadata
+internal/config/        Layered configuration (aegis.json)
 internal/correlate/     Correlation engine (time-window pattern detection)
-internal/e2e/           End-to-end integration tests
 internal/egress/        Egress classification + secret redaction
-internal/events/        Canonical event schema + JSONL store
+internal/events/        Canonical event schema + append-only JSONL store
+internal/exitgate/      Local AI Exit Gate (evidence, redaction, review)
 internal/findings/      Finding schema + scanner parsers
-internal/images/        Embedded Dockerfiles (agent, proxy)
-internal/model/         Local (offline) advisory model client
+internal/images/        Embedded Dockerfiles (agent, proxy) + image names
+internal/model/         Self-hosted (local) advisory model client
 internal/network/       Egress gateway lifecycle + network profiles
 internal/observer/      Hook injection + normalization + tailer + live feed
 internal/paths/         Path constants (state dir, sessions)
@@ -223,30 +265,62 @@ internal/response/      Incident response + evidence bundles
 internal/sandbox/       Docker container management + isolation verification
 internal/session/       Session state machine + manager
 internal/tui/           Bubbletea split TUI (PTY, feed, status bar)
-internal/workspace/     Boundary (PROJECT_ROOT), manifest baseline + in-place diff/apply
+internal/workspace/     PROJECT_ROOT boundary, manifest baseline + in-place diff/apply
 scripts/install.sh      Installer
 docs/                   Threat model and event-schema documentation
 ```
 
-## Documentation
+## Testing
 
-- [Event Schema](docs/EVENT-SCHEMA.md) — the canonical event format shared by all components.
-- [Threat Model](docs/THREAT-MODEL.md) — detailed security boundaries and STRIDE/PASTA analysis.
-- [Authors](AUTHORS.md) — original author and maintainer information.
+```bash
+go vet ./...
+go test ./... -race
+```
 
-## Current project status
+These commands pass on the current tree. Some test files (`*_live_test.go`, the e2e suite) exercise a live Docker sandbox and are skipped automatically when Docker or `gitleaks` is unavailable.
 
-Early-stage but functional (`v0.1.0`). The core end-to-end pipeline works: sandbox launch, agent execution, file/tool/network observation, PreFlight scanning, and the BLOCK/FIX/remediation loop are implemented and covered by unit, live, and end-to-end tests. The split TUI renders the live agent terminal and security feed in real time.
+## Configuration
 
-## Known limitations
+Environment variables and config keys read by the source:
 
-- **Linux + Docker primary target.** macOS/Windows support is not provided.
-- **Secrets scanning relies on `gitleaks`** and dependency auditing on `npm-audit` / `pip-audit`; these must be available inside the sandbox image for full coverage.
-- **Allowlists are domain-based**; they block at the DNS/HTTP layer, not as a full outbound data-loss-prevention system.
-- **The local advisor is advisory only.** It never gates promotion; verdicts are deterministic and scanner-driven.
+| Setting | Type | Purpose |
+|---------|------|---------|
+| `AEGIS_REPO_ROOT` | env | Path to the source repo so a globally installed binary can build the proxy sidecar. |
+| `AEGIS_EXIT_GATE` | env (`1`) / `aegis.json` `exit_gate.enabled` | Enable the Local AI Exit Gate (disabled by default). |
+| `AEGIS_STATE_DIR` | env | Override the session state directory (default `~/.local/state/aegis`). |
+| `AEGIS_ALLOWLIST` | env | Comma-separated egress allowlist for the proxy (default `api.anthropic.com`). |
+| `AEGIS_UPSTREAM_DNS` | env | Upstream DNS resolver for the proxy (default `1.1.1.1`). |
+| `AEGIS_DOCKER_BIN` | env | Override the `docker` binary path. |
+| `AEGIS_REBUILD_PROXY` | env | Force the proxy image to be rebuilt even if present. |
+| `AEGIS_INSTALL_DIR` | env | Install target directory for `scripts/install.sh`. |
+| `aegis.json` | file | Project-level config: `default_network`, `gitleaks_path`, `scanners`, `limits`, `allowed_domains`, `exit_gate`. |
+
+Enable the exit gate in the project's `aegis.json` (config is also layered from `~/.config/aegis/config.json`):
+
+```json
+{
+  "exit_gate": {
+    "enabled": true,
+    "on_unavailable": "block",
+    "base_url": "http://127.0.0.1:8080",
+    "model": "qwen2.5-coder-1.5b-instruct"
+  }
+}
+```
+
+The exit gate is **disabled by default**. `on_unavailable` is `"block"` by default (fail‑closed) or `"warn"`. `base_url` is the local model server root (the client appends `/v1/chat/completions`; default `http://127.0.0.1:8080`) and `model` defaults to `qwen2.5-coder-1.5b-instruct`.
+
+## Limitations / Notes
+
+- **Linux + Docker is the primary target.** macOS/Windows support is not provided.
+- **Secrets scanning relies on `gitleaks`**, and dependency auditing on `npm-audit` / `pip-audit`; they must be present (inside the sandbox) for full coverage.
+- **Allowlists are domain-based.** They block at the DNS/HTTP layer; they are not a full outbound data‑loss‑prevention system.
+- **The Local AI advisor is advisory only.** Verdicts are deterministic and scanner‑driven; the AI can add a block but cannot override a deterministic one.
+- **Agent runtimes are ephemeral.** `HOME`/`TMPDIR` live on a per‑container tmpfs, so agent credential caches are not persisted across sessions.
+- Network profile `strict` permits only `api.anthropic.com`; use `--net dev` for package registries, git hosts, and `opencode.ai`.
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
-Copyright (c) 2026 [Roshan Mallick](https://github.com/Roshan-Mallick) — see [AUTHORS.md](AUTHORS.md).
+Copyright (c) 2026 [Roshan Mallick](https://github.com/Roshan-Mallick) — see [AUTHORS.md](AUTHORS.md) and [OWNERSHIP_EVIDENCE.md](OWNERSHIP_EVIDENCE.md).
