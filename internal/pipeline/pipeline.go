@@ -29,6 +29,8 @@ import (
 	"github.com/eth0x1/aegis/internal/agents"
 	"github.com/eth0x1/aegis/internal/correlate"
 	"github.com/eth0x1/aegis/internal/events"
+	"github.com/eth0x1/aegis/internal/exitgate"
+	"github.com/eth0x1/aegis/internal/findings"
 	"github.com/eth0x1/aegis/internal/images"
 	"github.com/eth0x1/aegis/internal/network"
 	"github.com/eth0x1/aegis/internal/observer"
@@ -90,6 +92,13 @@ type RunOptions struct {
 	// blocks; OnPass runs for a clean PASS. Both are advisory callbacks.
 	OnBlock func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult)
 	OnPass  func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult)
+
+	// ExitGate optionally enables the Local AI exit security review. It is
+	// constructed with the session id and store (so model events carry the
+	// session id) and runs ONLY after the deterministic preflight checks have
+	// passed. A nil field keeps deterministic-only behavior. The returned
+	// gate may be nil to disable the review for that session.
+	ExitGate func(sessionID string, store *events.Store) *exitgate.Gate
 }
 
 type RunResult struct {
@@ -299,10 +308,16 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 
 	// --------------------------------------------------------------- BLOCK | PASS
 	if !final.Passed {
+		blockReason := "BLOCKED"
+		if final.AIBlocked && final.Last != nil && final.Last.Blocking == 0 {
+			blockReason = "exit security review blocked"
+		}
 		if err := mgr.Transition(session.StateBlock, map[string]any{
 			"cycles":        final.Cycles,
 			"blocking_last": final.Last.Blocking,
 			"total_last":    final.Last.Total,
+			"ai_blocked":    final.AIBlocked,
+			"reason":        blockReason,
 		}); err != nil {
 			return res, err
 		}
@@ -314,6 +329,9 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 
 		res.State = session.StateBlock
 		res.Outcome = "blocked"
+		if final.AIBlocked && final.Last != nil && final.Last.Blocking == 0 && final.Last.Total == 0 {
+			return res, fmt.Errorf("EXIT SECURITY REVIEW BLOCKED (%d AI finding(s))", len(final.AIFindings))
+		}
 		return res, fmt.Errorf("PREFLIGHT BLOCKED — %d blocking finding(s)", final.Last.Blocking)
 	}
 
@@ -426,6 +444,18 @@ func runPreflightGate(ctx context.Context, opts RunOptions, mgr *session.Manager
 	final := &preflight.FinalResult{}
 	po := preflight.RunOptions{SessionID: mgr.Snapshot().SessionID, Store: mgr.Store()}
 
+	// The Local AI exit security review is an additive layer on top of the
+	// deterministic exit gate. It is constructed with the session id and
+	// store so its model events carry the same session lineage, and it only
+	// ever runs AFTER a cycle's deterministic checks have passed.
+	var gate *exitgate.Gate
+	if opts.ExitGate != nil {
+		gate = opts.ExitGate(mgr.Snapshot().SessionID, mgr.Store())
+		if gate == nil {
+			opts.print("exit-review: disabled for this session\n")
+		}
+	}
+
 	for cycle := 1; cycle <= preflight.MaxCycles; cycle++ {
 		opts.print("preflight:   cycle %d/%d\n", cycle, preflight.MaxCycles)
 		po.Cycle = cycle
@@ -437,16 +467,60 @@ func runPreflightGate(ctx context.Context, opts RunOptions, mgr *session.Manager
 		final.AllResults = append(final.AllResults, r)
 		final.Last = r
 		final.Cycles = cycle
-		if r.Blocking == 0 {
+
+		// Deterministic block: the local AI review is skipped entirely (it
+		// could never override this) and the deterministic findings drive
+		// the remediation round.
+		detBlock := r.Blocking > 0
+		aiBlock := false
+		var aiReview *exitgate.Review
+		if !detBlock && gate != nil {
+			ev, err := exitgate.BuildEvidence(ctx, exitgate.Input{
+				SessionID:  mgr.Snapshot().SessionID,
+				SessionDir: mgr.Dir(),
+				Workspace:  ws,
+				Cycle:      cycle,
+				Task:       strings.Join(opts.Args, " "),
+				Profile:    opts.Profile,
+				Findings:   allFindings(final),
+			})
+			if err != nil {
+				opts.print("exit-review: evidence build failed (%v) — treating review as unavailable\n", err)
+			}
+			aiReview = gate.Review(ctx, ev)
+			final.AIBlocked = aiReview.Decision != exitgate.Pass
+			final.AIFindings = aiReview.Findings
+			final.AIRisk = aiReview.Risk
+			final.AISummary = aiReview.Summary
+			final.AIUnavailable = aiReview.Unavailable
+			aiBlock = final.AIBlocked
+			switch {
+			case aiReview.Unavailable:
+				opts.print("exit-review: WARNING — local AI security review unavailable (%s); decision=%s\n",
+					aiReview.Summary, aiReview.Decision)
+			case aiBlock:
+				opts.print("exit-review: BLOCK (risk %s)\n", orNA(aiReview.Risk))
+			default:
+				opts.print("exit-review: PASS%s\n", cacheNote(aiReview))
+			}
+		}
+		if !detBlock && !aiBlock {
 			final.Passed = true
 			return final, nil
 		}
 
-		// BLOCK: hand the structured findings back to the workspace so the
-		// relaunched agent can act on them in the same session.
-		opts.print("preflight:   BLOCK (%d blocking finding(s)) — fix request written\n", r.Blocking)
-		if err := preflight.WriteFixRequest(mgr.Dir(), ws, cycle, r); err != nil {
-			opts.print("preflight:   warning: fix request not written: %v\n", err)
+		// BLOCK: hand concise remediation input back to the workspace so the
+		// relaunched agent can act on it in the same session.
+		if detBlock {
+			opts.print("preflight:   BLOCK (%d blocking finding(s)) — fix request written\n", r.Blocking)
+			if err := preflight.WriteFixRequest(mgr.Dir(), ws, cycle, r); err != nil {
+				opts.print("preflight:   warning: fix request not written: %v\n", err)
+			}
+		} else {
+			opts.print("preflight:   EXIT REVIEW BLOCKED — concise remediation findings written\n")
+			if err := exitgate.WriteFixRequest(mgr.Dir(), ws, cycle, aiReview); err != nil {
+				opts.print("preflight:   warning: exit-review fix request not written: %v\n", err)
+			}
 		}
 
 		if cycle == preflight.MaxCycles {
@@ -484,6 +558,64 @@ func runPreflightGate(ctx context.Context, opts RunOptions, mgr *session.Manager
 		}
 	}
 	return final, nil
+}
+
+// allFindings aggregates every unique finding across the remediation cycles
+// so the exit review sees the complete audit trail (earlier blocks plus the
+// current state), deduplicated by rule/file/line/message.
+func allFindings(final *preflight.FinalResult) []findings.Finding {
+	if final == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []findings.Finding
+	for _, r := range final.AllResults {
+		for _, f := range r.Findings {
+			key := f.Rule + "|" + f.File + "|" + itoa(f.Line) + "|" + f.Message
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func cacheNote(r *exitgate.Review) string {
+	if r.Cached {
+		return " (cached — unchanged evidence)"
+	}
+	return ""
+}
+
+func orNA(s string) string {
+	if s == "" {
+		return "n/a"
+	}
+	return s
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }
 
 // monitor ties the hook tailer, proxy log stream and correlation engine

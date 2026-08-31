@@ -12,7 +12,24 @@ type Config struct {
 	Scanners       ScannerConfig     `json:"scanners,omitempty"`
 	Limits         LimitsConfig      `json:"limits,omitempty"`
 	AllowedDomains []string          `json:"allowed_domains,omitempty"`
+	ExitGate       ExitGateConfig    `json:"exit_gate,omitempty"`
 	Extra          map[string]string `json:"extra,omitempty"`
+}
+
+// ExitGateConfig enables the Local AI exit security review. It is DISABLED by
+// default so deterministic AEGIS behavior is unchanged. When enabled, the
+// local model (default 127.0.0.1:8080) reviews a compact security summary at
+// the exit gate; a deterministic block can never be overridden.
+type ExitGateConfig struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	// OnUnavailable: "block" (default, safe) or "warn" (exit with an
+	// explicit warning). "block" never treats an unavailable advisor as
+	// security approval.
+	OnUnavailable string `json:"on_unavailable,omitempty"`
+	// BaseURL overrides the local model server (default http://127.0.0.1:8080).
+	BaseURL string `json:"base_url,omitempty"`
+	// Model overrides the default qwen2.5-coder-1.5b-instruct.
+	Model string `json:"model,omitempty"`
 }
 
 type ScannerConfig struct {
@@ -89,6 +106,18 @@ func merge(base, override *Config) {
 	}
 	if len(override.AllowedDomains) > 0 {
 		base.AllowedDomains = override.AllowedDomains
+	}
+	if override.ExitGate.Enabled {
+		base.ExitGate.Enabled = true
+	}
+	if override.ExitGate.OnUnavailable != "" {
+		base.ExitGate.OnUnavailable = override.ExitGate.OnUnavailable
+	}
+	if override.ExitGate.BaseURL != "" {
+		base.ExitGate.BaseURL = override.ExitGate.BaseURL
+	}
+	if override.ExitGate.Model != "" {
+		base.ExitGate.Model = override.ExitGate.Model
 	}
 	if len(override.Extra) > 0 {
 		if base.Extra == nil {

@@ -277,6 +277,15 @@ type FinalResult struct {
 	Cycles     int
 	Last       *Result
 	AllResults []*Result
+
+	// Exit-gate Local AI review outcome. Populated only when the exit gate
+	// is enabled and the deterministic checks passed; the AI review can
+	// never override a deterministic block.
+	AIBlocked     bool     `json:"-"`
+	AIFindings    []string `json:"-"`
+	AIRisk        string   `json:"-"`
+	AISummary     string   `json:"-"`
+	AIUnavailable bool     `json:"-"`
 }
 
 func RunLoop(ctx context.Context, workspaceDir string, opts RunOptions, cb LoopCallbacks, execFn ExecFunc) (*FinalResult, error) {

@@ -2,6 +2,9 @@ package pipeline_test
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/eth0x1/aegis/internal/events"
+	"github.com/eth0x1/aegis/internal/exitgate"
+	"github.com/eth0x1/aegis/internal/model"
 	"github.com/eth0x1/aegis/internal/network"
 	"github.com/eth0x1/aegis/internal/pipeline"
 	"github.com/eth0x1/aegis/internal/preflight"
@@ -452,4 +457,336 @@ func loadSessions(t *testing.T, stateRoot string) []session.Metadata {
 		}
 	}
 	return out
+}
+
+// advisorCtl drives the fake local model server used by the exit-gate
+// pipeline tests. Verdicts are popped from a queue in order (falling back to
+// content); a non-zero status turns every endpoint into an error so the gate
+// exercises its unavailable path.
+type advisorCtl struct {
+	mu      sync.Mutex
+	queue   []string
+	content string
+	status  int
+	calls   int
+}
+
+func (c *advisorCtl) enqueue(contents ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queue = append(c.queue, contents...)
+}
+
+func (c *advisorCtl) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func (c *advisorCtl) serve() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/health"):
+			if c.status != 0 {
+				w.WriteHeader(c.status)
+			}
+		case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"):
+			c.mu.Lock()
+			c.calls++
+			status := c.status
+			content := c.content
+			if len(c.queue) > 0 {
+				content = c.queue[0]
+				c.queue = c.queue[1:]
+			}
+			c.mu.Unlock()
+			if status != 0 {
+				w.WriteHeader(status)
+				return
+			}
+			payload := fmt.Sprintf(`{"choices":[{"message":{"content":%s}}],"usage":{"prompt_tokens":4,"completion_tokens":3}}`,
+				fmt.Sprintf("%q", content))
+			_, _ = w.Write([]byte(payload))
+		}
+	}
+}
+
+func reviewVerdictJSON(decision, risk string) string {
+	return fmt.Sprintf(`{"decision":%q,"risk":%q,"summary":"reviewed","findings":["fix the flagged issue"]}`, decision, risk)
+}
+
+// newExitGateOption wires the exit gate to a fake advisor server.
+func newExitGateOption(t *testing.T, ctl *advisorCtl) func(sessionID string, store *events.Store) *exitgate.Gate {
+	t.Helper()
+	server := httptest.NewServer(ctl.serve())
+	t.Cleanup(server.Close)
+	return func(sessionID string, store *events.Store) *exitgate.Gate {
+		client := model.New(sessionID, model.WithStore(store), model.WithBaseURL(server.URL))
+		return exitgate.New(client, exitgate.PolicyBlock)
+	}
+}
+
+// TestRunPipelineExitGateAIPassRequiresDeterministicPass runs clean
+// deterministic checks; the local AI review PASS is what unlocks the exit.
+func TestRunPipelineExitGateAIPassAfterDeterministicPass(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "main.go", "package main\n\nfunc main() {}\n")
+
+	ctl := &advisorCtl{content: reviewVerdictJSON("PASS", "LOW")}
+	onPass := make(chan struct{}, 1)
+	sb := &fakeSandbox{}
+	sb.sid = "11111111-0000-0000-0000-000000000001"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "opencode",
+		Profile:     "strict",
+		StateRoot:   t.TempDir(),
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox: func(sid, ws string, s *events.Store) pipeline.Sandbox {
+			sb.sid = sid
+			sb.ws = ws
+			return sb
+		},
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int { return 0 },
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		},
+		OnPass: func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult) {
+			onPass <- struct{}{}
+		},
+		ExitGate: newExitGateOption(t, ctl),
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != session.StatePass {
+		t.Fatalf("state = %s, want PASS", res.State)
+	}
+	if res.Final == nil || !res.Final.Passed {
+		t.Fatal("final not passed")
+	}
+	if res.Final.AIBlocked {
+		t.Fatal("AI review must not have blocked")
+	}
+	if ctl.callCount() != 1 {
+		t.Fatalf("advisor chat calls = %d, want 1", ctl.callCount())
+	}
+}
+
+// TestRunPipelineExitGateAIBlockDrivesRemediation proves the BLOCK →
+// remediation → second review PASS loop: the agent is relaunched in the same
+// session, edits the workspace, and only then may the session exit.
+func TestRunPipelineExitGateAIBlockDrivesRemediation(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "main.go", "package main\n")
+
+	ctl := &advisorCtl{}
+	ctl.enqueue(reviewVerdictJSON("BLOCK", "HIGH"), reviewVerdictJSON("PASS", "LOW"))
+	interactiveCalls := 0
+	firstSID := ""
+	var fixRequestPath string
+
+	sb := &fakeSandbox{}
+	sb.sid = "22222222-0000-0000-0000-000000000002"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "opencode",
+		Args:        []string{"opencode"},
+		Profile:     "strict",
+		StateRoot:   t.TempDir(),
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox: func(sid, ws string, s *events.Store) pipeline.Sandbox {
+			sb.sid = sid
+			sb.ws = ws
+			fixRequestPath = filepath.Join(ws, ".aegis", "FIX_REQUEST.md")
+			return sb
+		},
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int {
+			interactiveCalls++
+			sid := o.Manager.Snapshot().SessionID
+			if interactiveCalls == 1 {
+				firstSID = sid
+			} else {
+				// The remediation round edits the workspace so the evidence
+				// actually changes and the next review re-analyses it.
+				writeFile(t, projectRoot, "fixed.go", "package main\n")
+			}
+			return 0
+		},
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		},
+		ExitGate: newExitGateOption(t, ctl),
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != session.StatePass {
+		t.Fatalf("state = %s, want PASS after remediation", res.State)
+	}
+	if res.Final.Cycles != 2 {
+		t.Errorf("cycles = %d, want 2 (AI BLOCK then remediation PASS)", res.Final.Cycles)
+	}
+	if interactiveCalls != 2 {
+		t.Errorf("interactive launches = %d, want 2", interactiveCalls)
+	}
+	if res.SessionID != firstSID {
+		t.Errorf("remediation used a different session: %q vs %q", res.SessionID, firstSID)
+	}
+	if fixRequestPath == "" {
+		t.Fatal("fix request path not captured")
+	}
+	fixReq, err := os.ReadFile(fixRequestPath)
+	if err != nil {
+		t.Fatalf("exit-review FIX_REQUEST.md not returned to the agent workspace: %v", err)
+	}
+	if !strings.Contains(string(fixReq), "fix") || !strings.Contains(string(fixReq), "retry the final security review") {
+		t.Errorf("fix request lacks concise remediation guidance:\n%s", fixReq)
+	}
+	if ctl.callCount() != 2 {
+		t.Errorf("advisor chat calls = %d, want 2", ctl.callCount())
+	}
+}
+
+// TestRunPipelineExitGateAIBlockCannotExit proves that a local AI BLOCK on an
+// otherwise clean deterministic scan blocks the session.
+func TestRunPipelineExitGateAIBlockCannotExit(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "main.go", "package main\n")
+
+	ctl := &advisorCtl{content: reviewVerdictJSON("BLOCK", "HIGH")}
+	sb := &fakeSandbox{}
+	sb.sid = "33333333-0000-0000-0000-000000000003"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "shell",
+		Profile:     "strict",
+		StateRoot:   t.TempDir(),
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox:  NewFakeSandbox,
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int { return 0 },
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		},
+		ExitGate: newExitGateOption(t, ctl),
+		OnBlock: func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult) {
+			if final == nil || !final.AIBlocked {
+				// The AI findings themselves are the exhibit.
+			}
+		},
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected BLOCK error")
+	}
+	if res.State != session.StateBlock {
+		t.Fatalf("state = %s, want BLOCK", res.State)
+	}
+	if res.Final == nil || res.Final.Passed {
+		t.Fatal("final must not be passed")
+	}
+	if !res.Final.AIBlocked {
+		t.Fatal("final must record AIBlocked")
+	}
+	if res.Final.Last.Blocking != 0 {
+		t.Fatalf("deterministic findings should be zero, got %d", res.Final.Last.Blocking)
+	}
+}
+
+// TestRunPipelineExitGateDeterministicBlockOverridesAIPass pins the hard
+// rule: the local AI review cannot override a deterministic block (and is
+// skipped entirely to save tokens).
+func TestRunPipelineExitGateDeterministicBlockOverridesAIPass(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "package.json", `{"name":"demo","version":"1.0.0"}`)
+	writeFile(t, projectRoot, "package-lock.json", `{"name":"demo","lockfileVersion":2}`)
+	npmVuln := `{"vulnerabilities":{"tar":{"name":"tar","severity":"critical","via":["critical"]}}}`
+
+	ctl := &advisorCtl{content: reviewVerdictJSON("PASS", "NONE")}
+	sb := &fakeSandbox{}
+	sb.sid = "44444444-0000-0000-0000-000000000004"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "shell",
+		Profile:     "strict",
+		StateRoot:   t.TempDir(),
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox:  NewFakeSandbox,
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int { return 0 },
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "npm audit") {
+				return npmVuln, "", 0, nil
+			}
+			return "", "", 0, nil
+		},
+		ExitGate: newExitGateOption(t, ctl),
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected BLOCK error")
+	}
+	if res.State != session.StateBlock {
+		t.Fatalf("state = %s, want BLOCK", res.State)
+	}
+	if res.Final.Last.Blocking == 0 {
+		t.Fatal("expected a deterministic blocking finding")
+	}
+	if res.Final.AIBlocked {
+		t.Fatal("AI review must not be consulted on a deterministic block")
+	}
+	if ctl.callCount() != 0 {
+		t.Errorf("advisor chat calls = %d, want 0 (AI review skipped on deterministic BLOCK)", ctl.callCount())
+	}
+}
+
+// TestRunPipelineExitGateAdvisorUnavailableFailsSafe proves advisor failure
+// never weakens enforcement and is explicitly reported.
+func TestRunPipelineExitGateAdvisorUnavailableFailsSafe(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeFile(t, projectRoot, "main.go", "package main\n")
+
+	ctl := &advisorCtl{status: http.StatusInternalServerError}
+	sb := &fakeSandbox{}
+	sb.sid = "55555555-0000-0000-0000-000000000005"
+
+	opts := pipeline.RunOptions{
+		ProjectRoot: projectRoot,
+		Agent:       "shell",
+		Profile:     "strict",
+		StateRoot:   t.TempDir(),
+		Print:       func(string, ...any) {},
+		NewGateway:  NewFakeGateway,
+		NewSandbox:  NewFakeSandbox,
+		Interactive: func(ctx context.Context, o pipeline.InteractiveOptions) int { return 0 },
+		PreflightExec: func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		},
+		ExitGate: newExitGateOption(t, ctl),
+	}
+
+	res, err := pipeline.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("unavailable advisor under block policy must block exit")
+	}
+	if res.State != session.StateBlock {
+		t.Fatalf("state = %s, want BLOCK", res.State)
+	}
+	if !res.Final.AIBlocked || !res.Final.AIUnavailable {
+		t.Fatalf("unavailable must be recorded: AIBlocked=%v AIUnavailable=%v",
+			res.Final.AIBlocked, res.Final.AIUnavailable)
+	}
 }

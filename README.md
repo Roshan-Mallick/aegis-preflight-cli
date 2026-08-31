@@ -68,7 +68,7 @@ AEGIS has two network operating modes:
 | **strict (default)** | `--net strict` | Only `api.anthropic.com` is reachable. Everything else, including raw IPs and private ranges, is blocked. Suitable for the highest-assurance workloads. |
 | **dev** | `--net dev` | Adds common development hosts to the allowlist (`registry.npmjs.org`, `pypi.org`, `proxy.golang.org`, `github.com`, `opencode.ai`, etc.). Enables dependency fetching and toolchains inside the sandbox. |
 
-The **control plane itself is always offline** — it never phones home. Its decisions are deterministic and computed locally. The optional local advisor is a self-hosted LLM served from `127.0.0.1` and is advisory only; it never affects the security verdict.
+The **control plane itself is always offline** — it never phones home. Its decisions are computed locally. The optional **local AI exit review** is a self-hosted LLM served from `127.0.0.1`; when enabled it acts as a final security reviewer at the exit gate (see below). It is disabled by default.
 
 ## How the security / remediation workflow works
 
@@ -92,6 +92,31 @@ ENTRY → PROJECT BASELINE → SANDBOX → AGENT (ACTIVE) → AGENT_FINISHED →
 4. If findings are non-blocking, the session passes and its change set can be validated and recorded with `aegis apply`.
 5. If blocking findings exist, a fix request is written and the agent may re-run (same session, same project) to remediate; it is rescanned. This BLOCK → FIX → relaunch → PASS cycle runs at most 3 times.
 6. Every meaningful event is recorded to the session's authoritative event store for audit.
+
+## Local AI exit review (optional)
+
+An optional self-hosted LLM (`model.New` + the existing OpenAI-compatible chat endpoint) performs a **final exit security review** after the deterministic scan passes — before a session may change state to `PASS`. Key properties:
+
+- **Token-budget evidence, not conversation history.** The reviewer receives a compact summary: paths of changed files, command/program hashes, network destinations that were attempted, sensitive-file accesses, scanner findings, and redacted snippets (only when a scanner finding or sensitive access points at a file). Secrets and exact file contents are never sent (`Redact` masks `sk-/pk-/ak-/rk-`, AWS keys, GitHub tokens, slack/webhook tokens, generic `key=value` assignments, PEM blocks, Bearer headers, `user:pass` URLs). If nothing external was observed the prompt literally states `"External access: none"` / `"Screen/UI access: none observed"` — silence is never implied.
+- **Strict JSON verdict.** The reviewer must answer a fixed set of questions (did the agent launch other tools, access sensitive files, attempt external destinations, expose secrets, maintain the security boundary) and return `{"decision":"PASS"|"BLOCK","risk":"NONE"|"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","summary":...,"findings":[...]}`. Prose-wrapped JSON is tolerated; anything unparseable is treated as an error.
+- **Caching.** Reviews are cached by a digest of the evidence (`review_id` = sha256 of the evidence JSON). If remediation produces no material workspace change, the next cycle reuses the cached review — unchanged evidence is never re-sent to the model.
+- **Safe failure.** If `exit_gate.on_unavailable` is `"block"` (default, fail-closed) an unavailable/unparseable reviewer **blocks** the session. With `"warn"` it passes but the session is explicitly flagged "advisory skipped". A `BLOCK` never approves.
+- **Deterministic override.** An exit review **cannot** override a deterministic block — deterministic blocks are final and skip the review entirely to save tokens. On an AI `BLOCK` the agent is handed a concise `.aegis/FIX_REQUEST.md` and may relaunch in the same sandbox/session for remediation; the improved evidence is then re-reviewed.
+
+Enable it in `aegis.json` (checked when a session starts), or `AEGIS_EXIT_GATE=1`:
+
+```json
+{
+  "exit_gate": {
+    "enabled": true,
+    "on_unavailable": "block",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "aegis-review"
+  }
+}
+```
+
+The bridge connects using the session's project `aegis.json` (falls back to `~/.config/aegis/aegis.json`), and `base_url`/`model` fall back to any top-level `model`/`base_url` values. Disabled by default, so deterministic-only enforcement is unchanged.
 
 ## Installation / build
 

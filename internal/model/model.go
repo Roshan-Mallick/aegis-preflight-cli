@@ -48,6 +48,16 @@ func WithModel(name string) Option {
 	}
 }
 
+// WithBaseURL overrides the local model server endpoint (default
+// model.DefaultBaseURL).
+func WithBaseURL(url string) Option {
+	return func(c *Client) {
+		if url != "" {
+			c.BaseURL = url
+		}
+	}
+}
+
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) {
 		if d > 0 {

@@ -10,6 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/eth0x1/aegis/internal/config"
+	"github.com/eth0x1/aegis/internal/events"
+	"github.com/eth0x1/aegis/internal/exitgate"
 	"github.com/eth0x1/aegis/internal/findings"
 	"github.com/eth0x1/aegis/internal/model"
 	"github.com/eth0x1/aegis/internal/pipeline"
@@ -99,11 +102,17 @@ func runSandbox(args []string, netProfile, projectPath, uiMode string) error {
 		},
 		OnBlock: func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult) {
 			printBlocked(mgr, final)
+			// An AI-only block was already reviewed by the local model; do
+			// not also run the advisory findings explainer.
+			if final != nil && final.AIBlocked && (final.Last == nil || final.Last.Blocking == 0) {
+				return
+			}
 			runModelAnalysis(ctx, mgr, ws, final)
 		},
 		OnPass: func(ctx context.Context, mgr *session.Manager, ws string, final *preflight.FinalResult) {
 			printPassed(mgr, final)
 		},
+		ExitGate: buildExitGate(projectRoot),
 	}
 	opts.Interactive = interactiveFor(uiMode, args, agentName, profile)
 
@@ -121,6 +130,30 @@ func runSandbox(args []string, netProfile, projectPath, uiMode string) error {
 
 func printBlocked(mgr *session.Manager, final *preflight.FinalResult) {
 	snap := mgr.Snapshot()
+
+	if final != nil && final.AIBlocked && (final.Last == nil || final.Last.Blocking == 0) {
+		fmt.Fprintf(os.Stderr, "\n=== EXIT SECURITY REVIEW BLOCKED ===\n")
+		fmt.Fprintf(os.Stderr, "Session:     %s\n", shortID(snap.SessionID))
+		fmt.Fprintf(os.Stderr, "Cycles:      %d\n", final.Cycles)
+		if final.AIUnavailable {
+			fmt.Fprintf(os.Stderr, "Local AI security review UNAVAILABLE — exit blocked under the safe policy.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "Risk:        %s\n", orDisplay(final.AIRisk))
+			if final.AISummary != "" {
+				fmt.Fprintf(os.Stderr, "\n%s\n", final.AISummary)
+			}
+			if len(final.AIFindings) > 0 {
+				fmt.Fprintf(os.Stderr, "\nFindings:\n")
+				for _, f := range final.AIFindings {
+					fmt.Fprintf(os.Stderr, "- %s\n", f)
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "\nFix these issues and retry the final security review.\n")
+		fmt.Fprintf(os.Stderr, "The flagged changes were left in your project directory (%s).\n", snap.ProjectRoot)
+		return
+	}
+
 	fmt.Fprintf(os.Stderr, "\n=== PREFLIGHT BLOCKED ===\n")
 	fmt.Fprintf(os.Stderr, "Session:     %s\n", shortID(snap.SessionID))
 	fmt.Fprintf(os.Stderr, "Cycles:      %d\n", final.Cycles)
@@ -137,6 +170,13 @@ func printBlocked(mgr *session.Manager, final *preflight.FinalResult) {
 	fmt.Fprintf(os.Stderr, "\nThe flagged changes were left in your project directory (%s) and are BLOCKED.\n", snap.ProjectRoot)
 	fmt.Fprintf(os.Stderr, "Fix the issues directly (they are already in place) and run 'aegis run' again.\n")
 	fmt.Fprintf(os.Stderr, "View details: aegis preflight %s\n", shortID(snap.SessionID))
+}
+
+func orDisplay(s string) string {
+	if s == "" {
+		return "n/a"
+	}
+	return s
 }
 
 // uniqueBlocking collapses identical blocking findings (same rule, file,
@@ -168,8 +208,48 @@ func printPassed(mgr *session.Manager, final *preflight.FinalResult) {
 	fmt.Fprintf(os.Stderr, "Session:     %s\n", shortID(snap.SessionID))
 	fmt.Fprintf(os.Stderr, "Cycles:      %d\n", final.Cycles)
 	fmt.Fprintf(os.Stderr, "Scanners:    %s\n", strings.Join(final.Last.ScannersRun, ", "))
+	if final != nil && final.AIUnavailable {
+		fmt.Fprintf(os.Stderr, "Local AI security review UNAVAILABLE (warn policy) — advisory review skipped.\n")
+	}
 	fmt.Fprintf(os.Stderr, "\nSession is verified. Changes already live in your project (%s).\n", snap.ProjectRoot)
 	fmt.Fprintf(os.Stderr, "Run 'aegis apply %s' to validate and record the promotion.\n", shortID(snap.SessionID))
+}
+
+// buildExitGate returns a RunOptions.ExitGate factory, or nil when the Local
+// AI exit review is disabled (the default, keeping deterministic AEGIS
+// behavior unchanged). Enabling via config (aegis.json
+// {"exit_gate":{"enabled":true}}) or the AEGIS_EXIT_GATE=1 environment
+// variable runs a compact security summary past the local model at the exit
+// gate only — never the conversation, source files, or secrets.
+func buildExitGate(projectRoot string) func(sessionID string, store *events.Store) *exitgate.Gate {
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		cfg = &config.Config{}
+	}
+	enabled := cfg.ExitGate.Enabled
+	if v, ok := os.LookupEnv("AEGIS_EXIT_GATE"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			enabled = b
+		}
+	}
+	if !enabled {
+		return nil
+	}
+
+	onDown := cfg.ExitGate.OnUnavailable
+	if onDown == "" {
+		onDown = exitgate.PolicyBlock
+	}
+	baseURL := cfg.ExitGate.BaseURL
+	mdl := cfg.ExitGate.Model
+
+	return func(sessionID string, store *events.Store) *exitgate.Gate {
+		client := model.New(sessionID,
+			model.WithStore(store),
+			model.WithModel(mdl),
+			model.WithBaseURL(baseURL))
+		return exitgate.New(client, onDown)
+	}
 }
 
 func detectAgentName(args []string) string {
