@@ -95,7 +95,10 @@ func DockerAvailable(timeout time.Duration) error {
 
 func EnsureAgentImage(ctx context.Context) error {
 	if _, err := docker(ctx, "image", "inspect", images.AgentImage); err == nil {
-		return nil
+		out, _ := docker(ctx, "image", "inspect", "--format", "{{index .Config.Labels \"com.aegis.build\"}}", images.AgentImage)
+		if strings.TrimSpace(string(out)) == images.BuildVersion {
+			return nil
+		}
 	}
 	tmp, err := os.MkdirTemp("", "aegis-build-")
 	if err != nil {
@@ -107,7 +110,9 @@ func EnsureAgentImage(ctx context.Context) error {
 	}
 	buildCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	out, err := docker(buildCtx, "build", "-t", images.AgentImage, tmp)
+	out, err := docker(buildCtx, "build", "-t", images.AgentImage,
+		"--label", "com.aegis.managed=true", "--label", "com.aegis.resource=agent-image",
+		"--label", "com.aegis.build="+images.BuildVersion, tmp)
 	if err != nil {
 		tail := string(out)
 		if len(tail) > 2000 {
@@ -156,6 +161,9 @@ func (s *Sandbox) Start(ctx context.Context) error {
 	args := []string{
 		"run", "-d",
 		"--name", s.Name,
+		"--label", "com.aegis.managed=true",
+		"--label", "com.aegis.resource=sandbox",
+		"--label", "com.aegis.session=" + s.SessionID,
 	}
 	args = append(args, networkArgs...)
 	args = append(args,

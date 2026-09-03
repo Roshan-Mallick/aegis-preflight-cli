@@ -13,7 +13,10 @@ import (
 	"github.com/eth0x1/aegis/internal/events"
 )
 
-const metadataFileName = "metadata.json"
+const (
+	metadataFileName = "metadata.json"
+	managedMarker    = ".aegis-managed-session"
+)
 
 func Dir(stateRoot, id string) string {
 	return filepath.Join(stateRoot, "sessions", id)
@@ -53,6 +56,9 @@ func Create(stateRoot, projectRoot, agent, netProfile string) (*Manager, error) 
 	dir := Dir(stateRoot, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, managedMarker), []byte("AEGIS\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("mark session ownership: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	m := &Manager{

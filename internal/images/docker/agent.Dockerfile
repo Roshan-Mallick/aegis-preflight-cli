@@ -7,6 +7,8 @@ RUN apt-get update \
 		python3 python3-pip git curl ca-certificates ripgrep jq procps \
 	&& rm -rf /var/lib/apt/lists/*
 
+RUN python3 -m pip install --no-cache-dir --break-system-packages pip-audit
+
 # Harden /etc: replace the full passwd/shadow/group with a single sandbox
 # user. TLS certs, nsswitch.conf, and other system files are preserved.
 # This runs as root during image build, so we have write access.

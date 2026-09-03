@@ -68,7 +68,9 @@ func out3(args ...string) (string, error) {
 
 func EnsureProxyImage(ctx context.Context) error {
 	if _, err := docker(ctx, "image", "inspect", images.ProxyImage); err == nil {
-		if os.Getenv("AEGIS_REBUILD_PROXY") == "" {
+		out, _ := docker(ctx, "image", "inspect", "--format", "{{index .Config.Labels \"com.aegis.build\"}}|{{json .Config.Entrypoint}}", images.ProxyImage)
+		parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 2)
+		if os.Getenv("AEGIS_REBUILD_PROXY") == "" && len(parts) == 2 && parts[0] == images.BuildVersion && strings.Contains(parts[1], "/aegis-proxy") {
 			return nil
 		}
 	}
@@ -109,11 +111,30 @@ func EnsureProxyImage(ctx context.Context) error {
 	if err := images.WriteProxyContext(ctxDir, binPath); err != nil {
 		return err
 	}
-	out, err := docker(buildCtx, "build", "-t", images.ProxyImage, ctxDir)
+	out, err := docker(buildCtx, "build", "-t", images.ProxyImage,
+		"--label", "com.aegis.managed=true", "--label", "com.aegis.resource=proxy-image",
+		"--label", "com.aegis.build="+images.BuildVersion, ctxDir)
 	if err != nil {
 		return fmt.Errorf("proxy image build failed: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func installedProxyBinary() string {
+	if configured := os.Getenv("AEGIS_PROXY_BIN"); configured != "" {
+		if info, err := os.Stat(configured); err == nil && info.Mode()&0111 != 0 {
+			return configured
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	candidate := filepath.Join(filepath.Dir(exe), "..", "lib", "aegis", "aegis-proxy")
+	if info, err := os.Stat(candidate); err == nil && info.Mode()&0111 != 0 {
+		return candidate
+	}
+	return ""
 }
 
 func findRepoRoot(start string) string {
@@ -161,7 +182,8 @@ func (g *Gateway) Up(ctx context.Context) error {
 	defer cancel()
 	_, _ = docker(cctx, "rm", "-f", g.ProxyName)
 	_, _ = docker(cctx, "network", "rm", g.NetName)
-	if out, err := docker(cctx, "network", "create", "--internal", "--driver", "bridge", g.NetName); err != nil {
+	if out, err := docker(cctx, "network", "create", "--internal", "--driver", "bridge",
+		"--label", "com.aegis.managed=true", "--label", "com.aegis.resource=session-network", g.NetName); err != nil {
 		return fmt.Errorf("create internal network: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	g.emit("gateway.up", events.SevInfo, map[string]any{"network": g.NetName})
@@ -170,6 +192,9 @@ func (g *Gateway) Up(ctx context.Context) error {
 	runArgs := []string{
 		"run", "-d",
 		"--name", g.ProxyName,
+		"--label", "com.aegis.managed=true",
+		"--label", "com.aegis.resource=proxy",
+		"--label", "com.aegis.session=" + g.SessionID,
 		"--network", g.NetName,
 		"--read-only",
 		"--cap-drop", "ALL",

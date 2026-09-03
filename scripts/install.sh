@@ -96,11 +96,11 @@ build_from_source() {
 }
 
 init_docker() {
-  info "Running aegis init to build sandbox images..."
+  info "Running the complete checkout bootstrap..."
   if "$INSTALL_DIR/$BINARY_NAME" init 2>&1 | tail -5; then
     info "Sandbox images ready."
   else
-    warn "aegis init had issues. Run 'aegis doctor' to diagnose."
+    warn "Sandbox initialization had issues. Use ./build.sh from the source checkout."
   fi
 }
 
@@ -133,8 +133,7 @@ main() {
 
   echo ""
   info "Quick start:"
-  info "  aegis doctor    # verify environment"
-  info "  aegis init      # build sandbox images"
+  info "  ./build.sh      # complete source checkout bootstrap"
   info "  aegis           # launch TUI in current directory"
   echo ""
 

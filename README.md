@@ -6,13 +6,10 @@ The agent runs inside a controlled boundary, not on a trusted machine with full 
 
 ```
 AI Coding Agent
+./build.sh
       |
-      v
-    AEGIS
-      |
-      v
- Sandboxed Project
-      |
+export AEGIS_REPO_ROOT="$HOME/aegis-preflight-cli"
+aegis run opencode
       v
 Deterministic Security Checks
       |
@@ -189,10 +186,9 @@ assets/                 Working demo video (assets/working.mp4)
 
 - **Linux amd64** — required (the installer and the sandbox target Linux x86‑64; macOS/Windows are not supported).
 - **Docker Engine** with the **daemon running** and your user able to talk to it.
-- **Go 1.27+** — to build from source.
-- **opencode** (for `aegis run opencode`) — the CLI agent launched inside the sandbox. Claude Code and Codex are also detected.
-- **gitleaks** *(strongly recommended)* — host‑side secret scanner; the PreFlight gate reports `scanner-unavailable` (and blocks) if it is missing.
-- **First‑run internet access** — `aegis init` builds the sandbox Docker images; the first build may download base layers.
+- **Go 1.27+** — used by the bootstrap to build from source and provision gitleaks when absent.
+- An AI coding agent is not required for installation; supply any executable available on your `PATH` at runtime, for example `aegis run <AI_AGENT>`.
+- **First‑run internet access** — `build.sh` builds the sandbox Docker images and provisions gitleaks; the first build may download layers and Go modules.
 
 ### Clone, build, initialize
 
@@ -200,17 +196,14 @@ assets/                 Working demo video (assets/working.mp4)
 git clone https://github.com/Roshan-Mallick/aegis-preflight-cli
 cd aegis-preflight-cli
 
-# Build the CLI
-go build -o aegis ./cmd/aegis
-
-# Build sandbox images and verify dependencies (first run may download layers)
-./aegis init
-
-# Verify your environment (Docker daemon, images, gitleaks)
-./aegis doctor
+# Build, initialize, provision security tooling, and run health checks
+./build.sh
 
 # Launch opencode inside the hardened sandbox (strict network)
-./aegis run opencode
+aegis run opencode
+
+# Remove only AEGIS-owned resources and generated state
+./remove.sh
 ```
 
 ### Common setup notes
@@ -224,9 +217,9 @@ go build -o aegis ./cmd/aegis
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `permission denied` talking to Docker | user not in the `docker` group, or group not loaded in this shell | `sudo usermod -aG docker "$USER"`, then re‑login / `newgrp docker`; `docker ps` to verify |
-| `gitleaks not found` in `doctor` | gitleaks missing | install gitleaks or `go install github.com/gitleaks/gitleaks/v8@latest` |
+| `gitleaks` installation failed | Go cannot download modules | fix Go network access, then rerun `./build.sh` |
 | agent cannot write files in the sandbox | project dir not readable/writable by UID 1000 | `sudo chown -R 1000:1000 <project>` |
-| `aegis init` "first run may download base layers" | image layers not yet cached locally | ensure internet is available the first time; after that images are cached |
+| `./build.sh` reports image download errors | image layers or Go modules are not cached locally | ensure internet is available during the first bootstrap; rerun afterward |
 
 ### Installed / global binary workflow
 
@@ -240,7 +233,6 @@ It installs `aegis` into `~/bin` (override with `AEGIS_INSTALL_DIR`). When runni
 
 ```bash
 export AEGIS_REPO_ROOT="$HOME/aegis-preflight-cli"
-aegis init
 aegis run opencode
 ```
 
@@ -250,30 +242,28 @@ aegis run opencode
 
 ```bash
 # Build + initialize once
-go build -o aegis ./cmd/aegis
-./aegis init
-./aegis doctor
+./build.sh
 
 # Launch opencode in the sandbox (strict network by default)
-./aegis run opencode
+aegis run opencode
 
 # Launch with dev network access (package registries, git, opencode.ai)
-./aegis run --net dev opencode
+aegis run --net dev opencode
 
 # Open an interactive sandbox shell (split TUI)
-./aegis run
+aegis run
 
 # Run a one-shot command
-./aegis run "ls -la"
+aegis run "ls -la"
 
 # Inspect session state / list sessions / follow live events
-./aegis status
-./aegis sessions
-./aegis report --follow <session-id>
+aegis status
+aegis sessions
+aegis report --follow <session-id>
 
 # Post-exit: validate and record a verified session
-./aegis preflight <session-id>
-./aegis apply <session-id>
+aegis preflight <session-id>
+aegis apply <session-id>
 ```
 
 ---

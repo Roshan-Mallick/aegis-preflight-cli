@@ -111,7 +111,7 @@ func EnsureRuntimeImage(ctx context.Context) error {
 	if toolID == "" {
 		return fmt.Errorf("agent tool image %s is not present", images.AgentImage)
 	}
-	if runtimeFingerprint(ctx) == toolID {
+	if runtimeFingerprint(ctx) == toolID && runtimeBuildVersion(ctx) == images.BuildVersion {
 		return nil
 	}
 
@@ -147,11 +147,18 @@ func EnsureRuntimeImage(ctx context.Context) error {
 
 	out, err = docker(buildCtx,
 		"import", "--change", strings.Join([]string{"ENV", toolImageFingerprintEnv + "=" + toolID}, " "),
+		"--change", "LABEL com.aegis.managed=true", "--change", "LABEL com.aegis.resource=runtime-image",
+		"--change", "LABEL com.aegis.build="+images.BuildVersion,
 		tarPath, images.RuntimeImage)
 	if err != nil {
 		return fmt.Errorf("import runtime image: %w: %s", err, trim(out))
 	}
 	return nil
+}
+
+func runtimeBuildVersion(ctx context.Context) string {
+	out, _ := docker(ctx, "image", "inspect", "--format", "{{index .Config.Labels \"com.aegis.build\"}}", images.RuntimeImage)
+	return strings.TrimSpace(string(out))
 }
 
 // dockerExportTo writes `docker export <name>` to w.

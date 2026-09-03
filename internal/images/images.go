@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	BuildVersion = "4"
 	// AgentImage is the tooling source image: bash, node, python, git plus
 	// the AEGIS /bin/sh workspace-jail wrapper. The runtime image is derived
 	// from it by pruning it down to a strictly minimal, non-sensitive root

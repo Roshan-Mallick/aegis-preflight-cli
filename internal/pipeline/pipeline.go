@@ -158,6 +158,7 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	if err := mgr.Transition(session.StateSnapshotting, nil); err != nil {
 		return res, err
 	}
+	opts.print("  PREPARE_WORKSPACE  Preparing workspace...\n")
 	ws := opts.ProjectRoot
 	manifest, err := workspace.BuildManifest(ws)
 	if err != nil {
@@ -178,25 +179,37 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	if err := observer.InjectHooks(ws); err != nil {
 		return res, fmt.Errorf("inject observation hooks: %w", err)
 	}
-	opts.print("hooks:       claude + opencode observation injected\n")
+	opts.print("hooks:       observation hooks injected\n")
 
+	opts.print("  CHECK_DOCKER       Checking Docker...\n")
 	if err := checkDockerAccess(); err != nil {
 		return res, fmt.Errorf("docker: %w", err)
 	}
+	opts.print("  [OK] Docker\n")
 
 	// ------------------------------------------------------------- network gateway
 	gw, err := opts.gatewayFor(mgr)
 	if err != nil {
 		return res, err
 	}
-	opts.print("network:     %s (proxy sidecar)\n", opts.Profile)
+	opts.print("  PREPARE_NETWORK    Preparing network policy and security proxy...\n")
+	opts.print("  START_PROXY        Starting security proxy and egress network...\n")
 	if err := gw.Up(ctx); err != nil {
 		return res, fmt.Errorf("start network gateway: %w", err)
 	}
+	opts.print("  [OK] Network policy and security proxy\n")
 	defer gw.Down(ctx)
 
 	// ------------------------------------------------------------------ sandbox
 	sb := opts.sandboxFor(mgr, ws)
+	if opts.Agent != "" {
+		if a, err := agents.Detect(opts.Agent); err == nil {
+			if concrete, ok := sb.(*sandbox.Sandbox); ok {
+				concrete.AgentBin = a.BinaryPath
+				concrete.AgentBins[opts.Agent] = a.BinaryPath
+			}
+		}
+	}
 	sb.SetNetworkArgs(gw.AgentNetworkArgs())
 	if opts.Agent != "" {
 		if a, err := agents.Detect(opts.Agent); err == nil {
@@ -206,16 +219,18 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	if err := mgr.Transition(session.StateSandboxStarted, nil); err != nil {
 		return res, err
 	}
+	opts.print("  PREPARE_SANDBOX    Preparing hardened sandbox...\n")
 	if err := sb.Start(ctx); err != nil {
 		return res, fmt.Errorf("start sandbox: %w", err)
 	}
 	defer sb.Kill(ctx)
 	res.State = session.StateSandboxStarted
-	opts.print("sandbox:     %s\n", sb.ContainerName())
+	opts.print("  [OK] Sandbox (%s)\n", sb.ContainerName())
 
 	if err := sb.SetupWorkspaceJail(); err != nil {
 		opts.print("warning: workspace jail setup failed: %v\n", err)
 	}
+	opts.print("  [OK] Security initialization\n")
 
 	// ------------------------------------------------------------------- agent
 	if err := mgr.Transition(session.StateAgentStarted, map[string]any{
@@ -258,6 +273,9 @@ func Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		Feed:    feed,
 		Args:    shellArgs,
 		Profile: opts.Profile,
+	}
+	if len(opts.Args) > 0 {
+		opts.print("Launching %s...\n", opts.Args[0])
 	}
 	// Wait here for the agent to actually finish. The preflight gate below
 	// never sees the workspace while the agent process is still running.

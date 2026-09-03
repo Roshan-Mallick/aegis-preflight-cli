@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/eth0x1/aegis/internal/agents"
 	"github.com/eth0x1/aegis/internal/config"
 	"github.com/eth0x1/aegis/internal/events"
 	"github.com/eth0x1/aegis/internal/exitgate"
@@ -28,6 +29,9 @@ func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run [command] [args...]",
 		Short: "Launch an interactive Aegis sandbox",
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			UnknownFlags: true,
+		},
 		Long: `Launch a sandboxed shell session for the current project.
 
 With no arguments, opens an interactive shell inside the sandbox.
@@ -67,6 +71,7 @@ Examples:
 }
 
 func runSandbox(args []string, netProfile, projectPath, uiMode string) error {
+	fmt.Fprintln(os.Stderr, "AEGIS: Initializing secure execution environment...")
 	profile := strings.ToLower(netProfile)
 	if profile == "" {
 		profile = "strict"
@@ -119,6 +124,9 @@ func runSandbox(args []string, netProfile, projectPath, uiMode string) error {
 	ctx := context.Background()
 	res, err := pipeline.Run(ctx, opts)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "\nAEGIS startup failed")
+		fmt.Fprintf(os.Stderr, "  ✗ %v\n", err)
+		fmt.Fprintln(os.Stderr, "Execution blocked.")
 		if res != nil && res.State == session.StateBlock {
 			return err
 		}
@@ -257,11 +265,11 @@ func detectAgentName(args []string) string {
 		return "shell"
 	}
 	name := args[0]
-	known := []string{"opencode", "claude", "codex", "shell", "bash", "sh"}
-	for _, k := range known {
-		if name == k {
-			return name
-		}
+	if name == "shell" || name == "bash" || name == "sh" {
+		return name
+	}
+	if _, err := agents.Detect(name); err == nil {
+		return name
 	}
 	return "shell"
 }
@@ -309,17 +317,16 @@ func writeModelFindingsMD(sessionDir, sessionID string, resp *model.Response) er
 	return os.WriteFile(sessionDir+"/model-analysis.md", []byte(md), 0o600)
 }
 
-// isAgentName reports whether the detected command is a real CLI coding
-// agent (opencode/claude/codex). Those agents render their own native
-// full-screen terminal UI, so they are routed to the passthrough entry
-// point rather than AEGIS's embedded split TUI. Bare shells and arbitrary
-// commands ("shell", "bash", "sh", or any other command) are not agents.
+// isAgentName reports whether the command resolves to a user-provided
+// executable. Such commands receive native terminal passthrough; shell names
+// remain available for the embedded shell UI.
 func isAgentName(agentName string) bool {
 	switch agentName {
-	case "opencode", "claude", "codex":
-		return true
+	case "shell", "bash", "sh", "":
+		return false
 	}
-	return false
+	_, err := agents.Detect(agentName)
+	return err == nil
 }
 
 // interactiveFor selects the sandbox interactive entry point. passthrough

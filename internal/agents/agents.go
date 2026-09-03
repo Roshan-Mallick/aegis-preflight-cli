@@ -22,15 +22,25 @@ var registry = map[string]func() *Agent{
 }
 
 func Detect(name string) (*Agent, error) {
-	fn, ok := registry[name]
-	if !ok {
-		return nil, fmt.Errorf("unknown agent %q (supported: opencode, claude, codex)", name)
+	if fn, ok := registry[name]; ok {
+		a := fn()
+		if a == nil {
+			return nil, fmt.Errorf("agent %q not found on this system", name)
+		}
+		return a, nil
 	}
-	a := fn()
-	if a == nil {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return nil, fmt.Errorf("agent %q not found on this system or PATH", name)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve agent %q: %w", name, err)
+	}
+	if info, err := os.Stat(abs); err != nil || info.Mode()&0111 == 0 {
 		return nil, fmt.Errorf("agent %q not found on this system", name)
 	}
-	return a, nil
+	return &Agent{Name: name, BinaryPath: abs, Description: "user-provided AI agent"}, nil
 }
 
 func ListAvailable() []string {

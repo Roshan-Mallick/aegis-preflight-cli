@@ -68,14 +68,14 @@ func TestInteractiveForAgentRouting(t *testing.T) {
 	}
 }
 
-// TestIsAgentName ensures only real CLI agents are treated as agents.
+// TestIsAgentName ensures runtime-resolved executables are treated as agents.
 func TestIsAgentName(t *testing.T) {
-	for _, name := range []string{"opencode", "claude", "codex"} {
+	for _, name := range []string{"true", "ls"} {
 		if !isAgentName(name) {
 			t.Errorf("isAgentName(%q) = false, want true", name)
 		}
 	}
-	for _, name := range []string{"shell", "bash", "sh", "", "ls", "python"} {
+	for _, name := range []string{"shell", "bash", "sh", "", "missing-aegis-agent"} {
 		if isAgentName(name) {
 			t.Errorf("isAgentName(%q) = true, want false", name)
 		}

@@ -131,11 +131,11 @@ func checkDockerDaemon() (bool, string) {
 func checkImages() []checkResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", "aegis-agent:v1", "aegis-proxy:v1")
+	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", "aegis-agent:v1", "aegis-runtime:v1", "aegis-proxy:v1")
 	if err := cmd.Run(); err != nil {
-		return []checkResult{{stWarn, "required images", "missing aegis-agent:v1 / aegis-proxy:v1 — run 'aegis init'"}}
+		return []checkResult{{stWarn, "required images", "missing required AEGIS images — run './build.sh'"}}
 	}
-	return []checkResult{{stOK, "required images", "aegis-agent:v1, aegis-proxy:v1 present"}}
+	return []checkResult{{stOK, "required images", "aegis-agent:v1, aegis-runtime:v1, aegis-proxy:v1 present"}}
 }
 
 func toolChecks() []checkResult {

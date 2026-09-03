@@ -17,15 +17,16 @@ var settingsJSON string
 var opencodePluginJS string
 
 const (
-	hookBinDir       = ".aegis/bin"
-	rawLogDir        = ".aegis/raw"
-	rawLogName       = "hooks.jsonl"
-	claudeDir        = ".claude"
-	claudeSettings   = "settings.json"
-	opencodeDir      = ".opencode"
-	opencodePlugins  = "plugins"
-	opencodePlugin   = "aegis.js"
-	HookPath         = "/workspace/.aegis/bin/hook.sh"
+	hookBinDir      = ".aegis/bin"
+	rawLogDir       = ".aegis/raw"
+	rawLogName      = "hooks.jsonl"
+	claudeDir       = ".claude"
+	claudeSettings  = "settings.json"
+	opencodeDir     = ".opencode"
+	opencodePlugins = "plugins"
+	opencodePlugin  = "aegis.js"
+	HookPath        = "/workspace/.aegis/bin/hook.sh"
+	managedMarker   = ".aegis-managed"
 )
 
 func RawLogPath(workspace string) string {
@@ -43,6 +44,9 @@ func InjectHooks(workspace string) error {
 	}
 	if err := os.Chmod(script, 0o755); err != nil {
 		return err
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".aegis", managedMarker), []byte("AEGIS\n"), 0o600); err != nil {
+		return fmt.Errorf("mark AEGIS hooks: %w", err)
 	}
 	if err := injectClaudeHooks(workspace); err != nil {
 		return err
@@ -65,7 +69,10 @@ func injectClaudeHooks(workspace string) error {
 		}
 	}
 	path := filepath.Join(dir, claudeSettings)
-	return os.WriteFile(path, []byte(settingsJSON), 0o600)
+	if err := os.WriteFile(path, []byte(settingsJSON), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, managedMarker), []byte("AEGIS\n"), 0o600)
 }
 
 func injectOpenCodeHooks(workspace string) error {
@@ -80,5 +87,8 @@ func injectOpenCodeHooks(workspace string) error {
 		}
 	}
 	path := filepath.Join(dir, opencodePlugin)
-	return os.WriteFile(path, []byte(opencodePluginJS), 0o600)
+	if err := os.WriteFile(path, []byte(opencodePluginJS), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(workspace, opencodeDir, managedMarker), []byte("AEGIS\n"), 0o600)
 }
